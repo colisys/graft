@@ -197,9 +197,9 @@ final class LauncherScriptBuilderTests: XCTestCase {
         XCTAssertTrue(script.contains("docker"))
         XCTAssertTrue(script.contains("dbus-run-session"))
         XCTAssertTrue(script.contains("SESSION_FILE"))
-        XCTAssertTrue(script.contains("PNAME_SHORT"))
+        XCTAssertTrue(script.contains("GRAFT_PID_FILE"))
+        XCTAssertTrue(script.contains("exec -u graft"))
         XCTAssertTrue(script.contains("container did not become ready"))
-        XCTAssertTrue(script.contains("did not appear within 60s"))
     }
 
     func testInjectionIsQuoted() {

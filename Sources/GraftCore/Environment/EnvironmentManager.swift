@@ -348,6 +348,7 @@ public final class EnvironmentManager: ObservableObject {
         await refreshColimaState()
         await refreshContainerState()
         await refreshStats()
+        await reapOrphanedSessions()
         activeSessionCount = SessionRegistry.activeCount()
         lastRefresh = Date()
     }
@@ -994,14 +995,39 @@ public final class EnvironmentManager: ObservableObject {
     private func startIdleMonitor() {
         monitorTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 60 * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: 10 * 1_000_000_000)
                 guard let self else { return }
                 await self.evaluateIdleState()
             }
         }
     }
 
+    /// Kills Linux processes whose macOS launcher has disappeared (Force Quit,
+    /// crash, or a terminated session). Without this a closed app could keep
+    /// running invisibly inside the container and block idle suspension.
+    public func reapOrphanedSessions() async {
+        let stale = SessionRegistry.takeStaleSessions()
+        guard !stale.isEmpty else { return }
+        guard let docker = tools.docker, colimaState == .running else { return }
+
+        for session in stale {
+            guard let container = session.containerName, let pidFile = session.pidFile else { continue }
+            let script = """
+            pid=$(cat \(ShellQuote.quote(pidFile)) 2>/dev/null); \
+            if [ -n "$pid" ]; then kill "$pid" 2>/dev/null; /bin/sleep 0.3; kill -9 "$pid" 2>/dev/null; fi; \
+            rm -f \(ShellQuote.quote(pidFile))
+            """
+            _ = try? await runner.run(
+                docker,
+                ["exec", "-u", GraftConstants.runtimeUser, container, "bash", "-lc", script],
+                options: RunOptions(timeout: 15)
+            )
+            log.append("已清理退出应用的容器进程：\(session.appName)", level: .info)
+        }
+    }
+
     private func evaluateIdleState() async {
+        await reapOrphanedSessions()
         activeSessionCount = SessionRegistry.activeCount()
 
         // Never suspend Colima while a build, install, launch or XQuartz setup

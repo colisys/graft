@@ -292,6 +292,51 @@ public final class AppWrapperGenerator {
         }
     }
 
+    /// Rewrites `Contents/Resources/launch.sh` for a bundle created by an
+    /// older Graft version. The newer launcher records the container PID and
+    /// terminates the Linux process when the macOS app exits.
+    @discardableResult
+    public func upgradeLauncherScript(
+        at bundleURL: URL,
+        entry: DesktopEntry,
+        configuration: LauncherConfiguration
+    ) -> Bool {
+        let scriptURL = bundleURL
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("Resources", isDirectory: true)
+            .appendingPathComponent("launch.sh")
+        guard let current = try? String(contentsOf: scriptURL, encoding: .utf8),
+              !current.contains("GRAFT_PID_FILE") else { return false }
+
+        let bundleName = bundleURL.deletingPathExtension().lastPathComponent
+        let sessionID = sanitizeIdentifier(bundleName)
+        guard !SessionRegistry.activeSessions().contains(where: { $0.id.hasPrefix(sessionID + ".") }) else {
+            log.append("\(bundleName).app 正在运行，下次启动 Graft 时再更新启动器", level: .info)
+            return false
+        }
+
+        let script = LauncherScriptBuilder.build(
+            entry: entry,
+            configuration: configuration,
+            sessionID: sessionID
+        )
+        do {
+            try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+            try fileManager.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: scriptURL.path
+            )
+            log.append("已更新 \(bundleName).app 的启动器（退出应用时清理容器进程）", level: .info)
+            return true
+        } catch {
+            log.append(
+                "更新 \(bundleName).app 启动器失败：\(error.localizedDescription)",
+                level: .warning
+            )
+            return false
+        }
+    }
+
     // MARK: - Naming
 
     /// Removes a wrapper produced by the old naming scheme, which used the bare

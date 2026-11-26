@@ -7,12 +7,25 @@ public struct GraftSession: Identifiable, Sendable {
     public let pid: Int32
     public let startedAt: Date
     public let appName: String
+    /// Container that hosts the Linux process, when the launcher recorded it.
+    public let containerName: String?
+    /// Path inside the container to the PID file written by the launcher.
+    public let pidFile: String?
 
-    public init(id: String, pid: Int32, startedAt: Date, appName: String) {
+    public init(
+        id: String,
+        pid: Int32,
+        startedAt: Date,
+        appName: String,
+        containerName: String? = nil,
+        pidFile: String? = nil
+    ) {
         self.id = id
         self.pid = pid
         self.startedAt = startedAt
         self.appName = appName
+        self.containerName = containerName
+        self.pidFile = pidFile
     }
 }
 
@@ -50,8 +63,24 @@ public enum SessionRegistry {
         try? fileManager.createDirectory(at: logsDirectory, withIntermediateDirectories: true)
     }
 
-    /// Marker format written by launchers: `pid<TAB>unix-timestamp<TAB>appName`.
+    /// Marker format written by launchers:
+    /// `pid<TAB>unix-timestamp<TAB>appName<TAB>container<TAB>containerPIDFile`.
+    /// Older markers only contain the first three fields.
     public static func activeSessions() -> [GraftSession] {
+        scan().active
+    }
+
+    /// Removes markers whose host process is gone and returns them so the
+    /// container-side application process can be terminated.
+    public static func takeStaleSessions() -> [GraftSession] {
+        scan(removeStale: true).stale
+    }
+
+    public static func activeCount() -> Int {
+        activeSessions().count
+    }
+
+    private static func scan(removeStale: Bool = false) -> (active: [GraftSession], stale: [GraftSession]) {
         prepare()
         let fileManager = FileManager.default
         guard let files = try? fileManager.contentsOfDirectory(
@@ -59,10 +88,11 @@ public enum SessionRegistry {
             includingPropertiesForKeys: nil,
             options: [.skipsHiddenFiles]
         ) else {
-            return []
+            return ([], [])
         }
 
-        var sessions: [GraftSession] = []
+        var active: [GraftSession] = []
+        var stale: [GraftSession] = []
 
         for file in files where file.pathExtension == "session" {
             guard let contents = try? String(contentsOf: file, encoding: .utf8) else {
@@ -79,26 +109,28 @@ public enum SessionRegistry {
                 try? fileManager.removeItem(at: file)
                 continue
             }
-            let startedAt = Date(timeIntervalSince1970: timestamp)
-            guard isProcessAlive(pid) else {
-                try? fileManager.removeItem(at: file)
-                continue
-            }
-            sessions.append(
-                GraftSession(
-                    id: file.lastPathComponent,
-                    pid: pid,
-                    startedAt: startedAt,
-                    appName: fields.count > 2 ? fields[2] : file.deletingPathExtension().lastPathComponent
-                )
+            let session = GraftSession(
+                id: file.lastPathComponent,
+                pid: pid,
+                startedAt: Date(timeIntervalSince1970: timestamp),
+                appName: fields.count > 2 ? fields[2] : file.deletingPathExtension().lastPathComponent,
+                containerName: fields.count > 3 && !fields[3].isEmpty ? fields[3] : nil,
+                pidFile: fields.count > 4 && !fields[4].isEmpty ? fields[4] : nil
             )
+            if isProcessAlive(pid) {
+                active.append(session)
+            } else {
+                stale.append(session)
+                if removeStale {
+                    try? fileManager.removeItem(at: file)
+                }
+            }
         }
 
-        return sessions.sorted { $0.startedAt < $1.startedAt }
-    }
-
-    public static func activeCount() -> Int {
-        activeSessions().count
+        return (
+            active.sorted { $0.startedAt < $1.startedAt },
+            stale.sorted { $0.startedAt < $1.startedAt }
+        )
     }
 
     /// Creates a marker for an application launched directly from the Graft

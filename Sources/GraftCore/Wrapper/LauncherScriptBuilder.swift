@@ -66,6 +66,10 @@ public enum LauncherScriptBuilder {
         let startArguments = ShellQuote.join(configuration.colimaStartArguments)
         let runArguments = ShellQuote.join(configuration.containerRunArguments)
         let launchArguments = ShellQuote.join(configuration.launchTokens)
+        // The container-side command records its own PID before replacing
+        // itself with the app, so the host can kill it when the .app exits.
+        let innerLaunch = "echo $$ > \"$GRAFT_PID_FILE\"; exec \(launchArguments)"
+        let innerCleanup = "pid=$(cat \"$GRAFT_PID_FILE\" 2>/dev/null); if [ -n \"$pid\" ]; then kill \"$pid\" 2>/dev/null; /bin/sleep 0.3; kill -9 \"$pid\" 2>/dev/null; fi; rm -f \"$GRAFT_PID_FILE\""
 
         return """
         #!/bin/bash
@@ -84,7 +88,8 @@ public enum LauncherScriptBuilder {
         SESSION_DIR=\(quote(configuration.sessionDirectory))
         SESSION_ID=\(quote(sessionID))
         LOG_DIR=\(quote(configuration.logDirectory))
-        PNAME=\(quote(configuration.processName))
+        APP_PID_FILE="/tmp/graft-session-\(sessionID)-$$.pid"
+        ORIG_PPID=$PPID
 
         mkdir -p "$LOG_DIR" "$SESSION_DIR"
         LOG_FILE="$LOG_DIR/$SESSION_ID.log"
@@ -94,12 +99,15 @@ public enum LauncherScriptBuilder {
         echo "==== [$(date '+%Y-%m-%d %H:%M:%S')] Graft launching $NAME ===="
 
         marker_written=0
+        exec_pid=""
         cleanup() {
-          if [ "$marker_written" = "1" ]; then
-            rm -f "$SESSION_FILE"
-          fi
+          [ "$marker_written" = "1" ] || return 0
+          marker_written=0
+          "$DOCKER" exec -u graft -e GRAFT_PID_FILE="$APP_PID_FILE" "$CONTAINER" sh -c \(quote(innerCleanup)) >/dev/null 2>&1 || true
+          [ -n "$exec_pid" ] && kill "$exec_pid" 2>/dev/null || true
+          rm -f "$SESSION_FILE"
         }
-        trap cleanup EXIT INT TERM
+        trap cleanup EXIT INT TERM HUP
 
         # 1. XQuartz: allow local TCP connections and make sure it is running.
         if [ -n "$XQUARTZ" ]; then
@@ -152,37 +160,32 @@ public enum LauncherScriptBuilder {
 
         [ "$state" = "true" ] || { echo "ERROR: container did not become ready: $CONTAINER"; exit 1; }
 
-        # 4. Mark the session and launch the Linux process.
-        printf '%s\\t%s\\t%s\\n' "$$" "$(date +%s)" "$NAME" > "$SESSION_FILE"
+        # 4. Mark the session and run the app in the foreground so this .app
+        #    stays alive exactly as long as the Linux process does.
+        printf '%s\\t%s\\t%s\\t%s\\t%s\\n' "$$" "$(date +%s)" "$NAME" "$CONTAINER" "$APP_PID_FILE" > "$SESSION_FILE"
         marker_written=1
 
         echo "Launching inside container..."
-        if ! "$DOCKER" exec -d -u graft -e DISPLAY="$DISPLAY_HOST" -e HOME=/home/graft -e XDG_RUNTIME_DIR=/tmp/runtime-graft "$CONTAINER" \(launchArguments); then
-          echo "ERROR: docker exec failed"
-          /usr/bin/osascript -e 'display notification "Linux 应用启动失败，请查看 Graft 日志" with title "Graft"' >/dev/null 2>&1 || true
-          exit 1
-        fi
-
-        # 5. Keep this .app alive while the Linux process runs so the Dock icon
-        #    reflects a running application.
-        if [ -n "$PNAME" ]; then
-          PNAME_SHORT=${PNAME:0:15}
-          seen=0
-          for _ in $(/usr/bin/seq 1 60); do
-            if "$DOCKER" exec "$CONTAINER" pgrep -u graft -x "$PNAME_SHORT" >/dev/null 2>&1; then
-              seen=1
-              break
-            fi
-            /bin/sleep 1
-          done
-          if [ "$seen" = "1" ]; then
-            while "$DOCKER" exec "$CONTAINER" pgrep -u graft -x "$PNAME_SHORT" >/dev/null 2>&1; do
-              /bin/sleep 2
-            done
-          else
-            echo "WARNING: process $PNAME_SHORT did not appear within 60s"
+        "$DOCKER" exec -u graft -e GRAFT_PID_FILE="$APP_PID_FILE" -e DISPLAY="$DISPLAY_HOST" -e HOME=/home/graft -e XDG_RUNTIME_DIR=/tmp/runtime-graft "$CONTAINER" sh -c \(quote(innerLaunch)) &
+        exec_pid=$!
+        while kill -0 "$exec_pid" 2>/dev/null; do
+          if [ "$PPID" != "$ORIG_PPID" ] || ! kill -0 "$ORIG_PPID" 2>/dev/null; then
+            echo "Launcher parent exited; stopping the Linux application."
+            cleanup
+            exit 0
           fi
+          /bin/sleep 1
+        done
+        wait "$exec_pid"
+        status=$?
+        if [ "$status" -ne 0 ]; then
+          echo "WARNING: docker exec exited with code $status"
         fi
+        case "$status" in
+          125|126|127)
+            /usr/bin/osascript -e 'display notification "Linux 应用未能启动，请查看 Graft 日志" with title "Graft"' >/dev/null 2>&1 || true
+            ;;
+        esac
 
         echo "Application exited."
         """
