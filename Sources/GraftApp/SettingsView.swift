@@ -35,6 +35,7 @@ struct SettingsView: View {
         .onChange(of: environment.colimaCPU) { _ in model.notifySettingChanged("Colima CPU") }
         .onChange(of: environment.colimaMemoryGB) { _ in model.notifySettingChanged("Colima 内存") }
         .onChange(of: environment.electronGPUEnabled) { _ in model.notifySettingChanged("GPU 合成设置") }
+        .onChange(of: environment.electronFrameRateUnlockEnabled) { _ in model.notifySettingChanged("帧率限制") }
         .onChange(of: environment.displayScale) { _ in model.notifySettingChanged("Linux 应用缩放") }
         .onChange(of: environment.xquartzIGLXEnabled) { _ in model.notifySettingChanged("XQuartz GLX 设置") }
         .onChange(of: environment.dockerRegistryMirror) { _ in model.notifySettingChanged("镜像源") }
@@ -303,6 +304,17 @@ struct SettingsView: View {
             .disabled(model.isBusy || model.isActionPending)
 
             Text("默认追加 --disable-gpu 更稳定。开启后会改为 --ignore-gpu-blocklist / --enable-gpu-rasterization；已封装的应用需要重新封装才会生效，在软件渲染环境下可能更慢或崩溃。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Toggle(
+                "解除 Electron 应用帧率限制（修复卡顿）",
+                isOn: $environment.electronFrameRateUnlockEnabled
+            )
+            .disabled(model.isBusy || model.isActionPending)
+
+            Text("XQuartz 在窗口模式下把屏幕刷新率报告为 1 Hz，Chromium / Electron 应用（VS Code、Chrome、Slack 等）会据此把界面卡在约 1–2 fps，表现为严重卡顿。开启后 Graft 为 Electron 应用追加 --disable-frame-rate-limit，界面即可流畅刷新；仅在实际动画/滚动时占用 CPU，空闲时几乎不耗电。已封装的应用需重新封装才会生效。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

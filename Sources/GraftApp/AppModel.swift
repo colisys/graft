@@ -508,6 +508,7 @@ final class AppModel: ObservableObject {
         settings.environmentName = environment.environmentName
         settings.registryMirror = environment.dockerRegistryMirror
         settings.electronGPUEnabled = environment.electronGPUEnabled
+        settings.electronFrameRateUnlockEnabled = environment.electronFrameRateUnlockEnabled
         settings.xquartzIGLXEnabled = environment.xquartzIGLXEnabled
         settings.displayScale = environment.displayScale
         return ContainerOrchestrator(
@@ -588,6 +589,7 @@ final class AppModel: ObservableObject {
         settings.baseImage = base
         settings.environmentName = name
         settings.registryMirror = environment.dockerRegistryMirror
+        settings.electronFrameRateUnlockEnabled = environment.electronFrameRateUnlockEnabled
         let target = ContainerOrchestrator(log: log, runtimeSettings: settings)
         guard !containers.contains(where: { $0.name == target.containerName }) else {
             present(GraftError.installFailed("环境 \(name) 已存在。"))

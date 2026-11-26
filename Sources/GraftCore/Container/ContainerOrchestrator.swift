@@ -909,6 +909,17 @@ public final class ContainerOrchestrator: @unchecked Sendable {
             } else if !tokens.contains("--disable-gpu") {
                 tokens.append("--disable-gpu")
             }
+            if runtimeSettings.electronFrameRateUnlockEnabled {
+                // Rootless XQuartz reports a 1 Hz screen; Chromium trusts that
+                // value and throttles the compositor to ~1 fps. Removing the
+                // frame-rate limit restores smooth rendering. `--disable-gpu-vsync`
+                // is implied by this switch; adding it explicitly keeps older
+                // Electron/Chromium builds consistent.
+                for flag in ["--disable-frame-rate-limit", "--disable-gpu-vsync"]
+                where !tokens.contains(flag) {
+                    tokens.append(flag)
+                }
+            }
         }
         let scale = runtimeSettings.displayScale
         let scaleEnvironment: [String]

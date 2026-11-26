@@ -258,6 +258,7 @@ public final class RuntimeSettings: @unchecked Sendable {
     private var environmentNameStorage: String = ""
     private var mirrorStorage: String = ""
     private var electronGPUStorage = false
+    private var electronFrameRateUnlockStorage = false
     private var xquartzIGLXStorage = false
     private var displayScaleStorage = 1
 
@@ -327,6 +328,25 @@ public final class RuntimeSettings: @unchecked Sendable {
         set {
             lock.lock()
             xquartzIGLXStorage = newValue
+            lock.unlock()
+        }
+    }
+
+    /// Adds `--disable-frame-rate-limit` to Electron apps.
+    ///
+    /// Rootless XQuartz advertises a 1 Hz screen, and Chromium derives its
+    /// compositor frame budget from that value, throttling every Chromium /
+    /// Electron app to ~1 fps. This switch removes that limit. It only costs
+    /// CPU while the app is actually animating; static pages stay near idle.
+    public var electronFrameRateUnlockEnabled: Bool {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return electronFrameRateUnlockStorage
+        }
+        set {
+            lock.lock()
+            electronFrameRateUnlockStorage = newValue
             lock.unlock()
         }
     }

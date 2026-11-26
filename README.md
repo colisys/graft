@@ -405,7 +405,9 @@ Ubuntu / Debian 内置：
 
 Arch 使用 `pacman` 安装 `noto-fonts-cjk`、`gtk3/gtk4`、`nss`、`mesa` 等；Alpine 使用 `apk` 安装 `font-noto-cjk`、`gtk+3.0`、`mesa` 等，并设置 `LANG=C.UTF-8`（musl 不依赖 glibc locale）。
 
-Container 以 `--shm-size=2g` 启动，避免 Chromium 因 `/dev/shm` 过小崩溃。Electron 应用启动时自动追加 `--no-sandbox --disable-gpu`。Alpine 上的官方 Electron 构建兼容性有限，预设会避免提供这类应用。
+Container 以 `--shm-size=2g` 启动，避免 Chromium 因 `/dev/shm` 过小崩溃。Electron 应用启动时自动追加 `--no-sandbox --disable-gpu`，并在「设置 → 图形性能」开启「解除 Electron 应用帧率限制」后追加 `--disable-frame-rate-limit --disable-gpu-vsync`（默认开启）。Alpine 上的官方 Electron 构建兼容性有限，预设会避免提供这类应用。
+
+> **为什么需要解除帧率限制**：XQuartz 在窗口（rootless）模式下把屏幕刷新率报告为 1 Hz。Chromium 会读取该值作为合成器的帧预算，于是 VS Code、Chrome、Slack 等 Electron 应用被限流到约 1–2 fps，表现为严重卡顿。`--disable-frame-rate-limit` 移除该上限后，界面可正常流畅刷新。该参数只在实际动画/滚动时占用 CPU，静止页面几乎不耗电；若希望回到旧行为，可在设置中关闭此开关（需重新封装已生成的 `.app` 才会生效）。
 
 ### 8.5 宿主目录
 
@@ -445,6 +447,7 @@ Container 以 `--shm-size=2g` 启动，避免 Chromium 因 `/dev/shm` 过小崩�
 | 启动应用时 XQuartz 总是跳到前台 / 出现在 Dock | 新 launcher 使用 `open -g` 后台启动 XQuartz，不再抢焦点；如需完全隐藏 Dock/Cmd-Tab，设置里点击「隐藏图标」（修改 Info.plist，自动备份，需要管理员）。 |
 | 中文显示为方块 | 确认镜像构建包含 Noto CJK 字体（`fonts-noto-cjk` / `noto-fonts-cjk` / `font-noto-cjk`）；重新构建基础镜像 |
 | Electron 应用闪退 | 确认容器以 `--shm-size=2g` 启动；日志中检查 `--no-sandbox` |
+| Electron 应用（VS Code / Chrome / Slack）卡顿、画面每秒只刷新一两次 | XQuartz 窗口模式报告 1 Hz 刷新率，Chromium 据此限流。请在「设置 → 图形性能」确认「解除 Electron 应用帧率限制」为开启，并重新封装该应用（旧 `.app` 不含新参数）。 |
 | 图标是占位图 | 该应用可能只有 `.xpm` 图标；安装 `librsvg` 或手动替换 `.icns` |
 | 生成的应用打不开 | 查看 `~/Library/Application Support/Graft/logs/<id>.log` |
 

@@ -15,6 +15,7 @@ public final class EnvironmentManager: ObservableObject {
     public static let colimaCPUDefaultsKey = "graft.colimaCPU"
     public static let colimaMemoryDefaultsKey = "graft.colimaMemoryGB"
     public static let electronGPUDefaultsKey = "graft.electronGPU"
+    public static let electronFrameRateUnlockDefaultsKey = "graft.electronFrameRateUnlock"
     public static let xquartzIGLXDefaultsKey = "graft.xquartzIGLX"
     public static let displayScaleDefaultsKey = "graft.displayScale"
 
@@ -116,6 +117,19 @@ public final class EnvironmentManager: ObservableObject {
         }
     }
 
+    /// Adds `--disable-frame-rate-limit` to Electron apps so they stop being
+    /// throttled by XQuartz's 1 Hz reported refresh rate. Defaults on; existing
+    /// wrapped apps must be regenerated to pick it up.
+    @Published public var electronFrameRateUnlockEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(
+                electronFrameRateUnlockEnabled,
+                forKey: Self.electronFrameRateUnlockDefaultsKey
+            )
+            runtimeSettings.electronFrameRateUnlockEnabled = electronFrameRateUnlockEnabled
+        }
+    }
+
     /// XQuartz indirect GLX. Only affects OpenGL applications; restart XQuartz.
     @Published public var xquartzIGLXEnabled: Bool {
         didSet {
@@ -209,6 +223,14 @@ public final class EnvironmentManager: ObservableObject {
         let gpu = UserDefaults.standard.bool(forKey: Self.electronGPUDefaultsKey)
         self.electronGPUEnabled = gpu
         runtimeSettings.electronGPUEnabled = gpu
+
+        // Defaults to on: the 1 Hz XQuartz throttle affects every Electron app.
+        // A stored value wins so users who explicitly turned it off keep it off.
+        let frameUnlock = UserDefaults.standard.object(forKey: Self.electronFrameRateUnlockDefaultsKey) == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: Self.electronFrameRateUnlockDefaultsKey)
+        self.electronFrameRateUnlockEnabled = frameUnlock
+        runtimeSettings.electronFrameRateUnlockEnabled = frameUnlock
 
         let iglx = UserDefaults.standard.bool(forKey: Self.xquartzIGLXDefaultsKey)
         self.xquartzIGLXEnabled = iglx

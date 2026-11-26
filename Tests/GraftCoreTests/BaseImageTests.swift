@@ -254,4 +254,50 @@ final class BaseImageTests: XCTestCase {
         XCTAssertTrue(gpuTokens.contains("--ignore-gpu-blocklist"))
         XCTAssertTrue(gpuTokens.contains("--no-sandbox"))
     }
+
+    @MainActor
+    func testElectronFrameRateUnlockAddsLimitRemovalFlags() {
+        let contents = """
+        [Desktop Entry]
+        Type=Application
+        Name=Visual Studio Code
+        Exec=/usr/share/code/code --unity-launch %F
+        """
+        guard let entry = DesktopEntryParser.parse(
+            contents: contents,
+            filePath: "/usr/share/applications/code.desktop"
+        ) else {
+            return XCTFail("Failed to parse entry")
+        }
+
+        let settings = RuntimeSettings()
+        let orchestrator = ContainerOrchestrator(log: LogStore(), runtimeSettings: settings)
+
+        let defaultTokens = orchestrator.applicationTokens(for: entry)
+        XCTAssertFalse(defaultTokens.contains("--disable-frame-rate-limit"))
+        XCTAssertFalse(defaultTokens.contains("--disable-gpu-vsync"))
+
+        settings.electronFrameRateUnlockEnabled = true
+        let unlocked = orchestrator.applicationTokens(for: entry)
+        XCTAssertTrue(unlocked.contains("--disable-frame-rate-limit"))
+        XCTAssertTrue(unlocked.contains("--disable-gpu-vsync"))
+        XCTAssertTrue(unlocked.contains("--no-sandbox"))
+        // Unlocking the frame rate must not force GPU compositing on.
+        XCTAssertTrue(unlocked.contains("--disable-gpu"))
+    }
+
+    @MainActor
+    func testFrameRateUnlockDoesNotAffectNonElectronApps() {
+        let gimp = DesktopEntry(
+            filePath: "/usr/share/applications/gimp.desktop",
+            name: "GIMP",
+            exec: "gimp %F"
+        )
+        let settings = RuntimeSettings()
+        settings.electronFrameRateUnlockEnabled = true
+        let orchestrator = ContainerOrchestrator(log: LogStore(), runtimeSettings: settings)
+        let tokens = orchestrator.applicationTokens(for: gimp)
+        XCTAssertFalse(tokens.contains("--disable-frame-rate-limit"))
+        XCTAssertFalse(tokens.contains("--disable-gpu-vsync"))
+    }
 }
