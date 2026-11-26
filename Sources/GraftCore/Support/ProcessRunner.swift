@@ -264,11 +264,6 @@ public final class ProcessRunner: @unchecked Sendable {
                 return
             }
 
-            if let input = options.standardInput, let pipe = stdinPipe {
-                pipe.fileHandleForWriting.write(Data(input.utf8))
-                try? pipe.fileHandleForWriting.close()
-            }
-
             if let timeout = options.timeout, timeout > 0 {
                 DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) { [weak process] in
                     guard let process, process.isRunning else { return }
@@ -278,6 +273,13 @@ public final class ProcessRunner: @unchecked Sendable {
                         guard let process, process.isRunning else { return }
                         _ = kill(process.processIdentifier, SIGKILL)
                     }
+                }
+            }
+
+            if let input = options.standardInput, let pipe = stdinPipe {
+                DispatchQueue.global(qos: .utility).async {
+                    pipe.fileHandleForWriting.write(Data(input.utf8))
+                    try? pipe.fileHandleForWriting.close()
                 }
             }
         }

@@ -74,17 +74,15 @@ public final class AppWrapperGenerator {
         )
 
         let appName = sanitizeBundleName(entry.name, fallback: entry.executableToken)
-        let bundleName = configuration.containerName == configuration.baseImage.containerName
-            ? appName : "\(appName) [\(configuration.containerName)]"
+        let bundleName = "\(appName) [\(configuration.containerName)]"
         let bundleURL = Self.wrappersDirectory
             .appendingPathComponent(bundleName, isDirectory: true)
             .appendingPathExtension("app")
+        let stagingURL = Self.wrappersDirectory
+            .appendingPathComponent(".\(UUID().uuidString).app", isDirectory: true)
+        defer { try? fileManager.removeItem(at: stagingURL) }
 
-        if fileManager.fileExists(atPath: bundleURL.path) {
-            try? fileManager.removeItem(at: bundleURL)
-        }
-
-        let contentsURL = bundleURL.appendingPathComponent("Contents", isDirectory: true)
+        let contentsURL = stagingURL.appendingPathComponent("Contents", isDirectory: true)
         let macOSURL = contentsURL.appendingPathComponent("MacOS", isDirectory: true)
         let resourcesURL = contentsURL.appendingPathComponent("Resources", isDirectory: true)
         try fileManager.createDirectory(at: macOSURL, withIntermediateDirectories: true)
@@ -163,12 +161,14 @@ public final class AppWrapperGenerator {
 
         let launcherURL = macOSURL.appendingPathComponent("launcher")
         if let helper = launcherHelperURL() {
-            try? fileManager.removeItem(at: launcherURL)
-            try fileManager.copyItem(at: helper, to: launcherURL)
+            let stagedLauncher = macOSURL.appendingPathComponent("launcher.new")
+            try? fileManager.removeItem(at: stagedLauncher)
+            try fileManager.copyItem(at: helper, to: stagedLauncher)
             try fileManager.setAttributes(
                 [.posixPermissions: 0o755],
-                ofItemAtPath: launcherURL.path
+                ofItemAtPath: stagedLauncher.path
             )
+            _ = try fileManager.replaceItemAt(launcherURL, withItemAt: stagedLauncher)
         } else {
             log.append(
                 "未找到 GraftLauncher，回退到 shell 启动器；Dock 图标可能持续弹跳。",
@@ -180,6 +180,14 @@ public final class AppWrapperGenerator {
                 ofItemAtPath: launcherURL.path
             )
         }
+
+        if fileManager.fileExists(atPath: bundleURL.path) {
+            _ = try fileManager.replaceItemAt(bundleURL, withItemAt: stagingURL)
+        } else {
+            try fileManager.moveItem(at: stagingURL, to: bundleURL)
+        }
+
+        removeLegacyBundle(named: appName, containerName: configuration.containerName, desktopFile: entry.filePath, keeping: bundleURL)
 
         // Ask LaunchServices to refresh the icon / registration.
         if let lsregister = configuration.tools.lsregister {
@@ -285,6 +293,29 @@ public final class AppWrapperGenerator {
     }
 
     // MARK: - Naming
+
+    /// Removes a wrapper produced by the old naming scheme, which used the bare
+    /// app name for every container and therefore collided across base images.
+    private func removeLegacyBundle(
+        named appName: String,
+        containerName: String,
+        desktopFile: String,
+        keeping keptURL: URL
+    ) {
+        let legacyURL = Self.wrappersDirectory
+            .appendingPathComponent(appName, isDirectory: true)
+            .appendingPathExtension("app")
+        guard legacyURL.path != keptURL.path,
+              fileManager.fileExists(atPath: legacyURL.path) else { return }
+
+        let plistURL = legacyURL.appendingPathComponent("Contents/Info.plist")
+        guard let data = try? Data(contentsOf: plistURL),
+              let plist = (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? [String: Any],
+              plist["GraftContainerName"] as? String == containerName,
+              plist["GraftDesktopFile"] as? String == desktopFile else { return }
+
+        try? fileManager.removeItem(at: legacyURL)
+    }
 
     private func sanitizeBundleName(_ name: String, fallback: String) -> String {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)

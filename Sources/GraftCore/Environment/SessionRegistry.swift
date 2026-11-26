@@ -63,7 +63,6 @@ public enum SessionRegistry {
         }
 
         var sessions: [GraftSession] = []
-        let now = Date()
 
         for file in files where file.pathExtension == "session" {
             guard let contents = try? String(contentsOf: file, encoding: .utf8) else {
@@ -81,9 +80,7 @@ public enum SessionRegistry {
                 continue
             }
             let startedAt = Date(timeIntervalSince1970: timestamp)
-            let alive = isProcessAlive(pid)
-            let tooOld = now.timeIntervalSince(startedAt) > 7 * 24 * 60 * 60
-            if !alive || tooOld {
+            guard isProcessAlive(pid) else {
                 try? fileManager.removeItem(at: file)
                 continue
             }

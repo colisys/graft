@@ -18,6 +18,8 @@ public final class EnvironmentManager: ObservableObject {
     public static let electronFrameRateUnlockDefaultsKey = "graft.electronFrameRateUnlock"
     public static let xquartzIGLXDefaultsKey = "graft.xquartzIGLX"
     public static let displayScaleDefaultsKey = "graft.displayScale"
+    public static let autoSuspendDefaultsKey = "graft.autoSuspend"
+    public static let idleTimeoutDefaultsKey = "graft.idleTimeout"
 
     public nonisolated let log: LogStore
     private let runner: ProcessRunner
@@ -160,8 +162,18 @@ public final class EnvironmentManager: ObservableObject {
     @Published public private(set) var xquartzDockIconHidden = false
 
     /// Auto-suspend settings, exposed to the settings UI.
-    @Published public var idleTimeout: TimeInterval = 15 * 60
-    @Published public var autoSuspendEnabled = true
+    @Published public var idleTimeout: TimeInterval = 15 * 60 {
+        didSet {
+            guard idleTimeout != oldValue else { return }
+            UserDefaults.standard.set(idleTimeout, forKey: Self.idleTimeoutDefaultsKey)
+        }
+    }
+    @Published public var autoSuspendEnabled = true {
+        didSet {
+            guard autoSuspendEnabled != oldValue else { return }
+            UserDefaults.standard.set(autoSuspendEnabled, forKey: Self.autoSuspendDefaultsKey)
+        }
+    }
 
     public let host = HostResources.current
     public let architecture = HostArchitecture.current
@@ -239,6 +251,12 @@ public final class EnvironmentManager: ObservableObject {
         let scale = UserDefaults.standard.integer(forKey: Self.displayScaleDefaultsKey) == 2 ? 2 : 1
         self.displayScale = scale
         runtimeSettings.displayScale = scale
+
+        let storedTimeout = UserDefaults.standard.double(forKey: Self.idleTimeoutDefaultsKey)
+        self.idleTimeout = storedTimeout > 0 ? storedTimeout : 15 * 60
+        self.autoSuspendEnabled = UserDefaults.standard.object(forKey: Self.autoSuspendDefaultsKey) == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: Self.autoSuspendDefaultsKey)
 
         SessionRegistry.prepare()
         let located = Self.locateTools()
@@ -511,7 +529,7 @@ public final class EnvironmentManager: ObservableObject {
             let download = try await runner.run(
                 curl,
                 [
-                    "-fL", "--retry", "3", "--retry-delay", "2",
+                    "-fL", "--retry", "3", "--retry-delay", "2", "--retry-all-errors",
                     "--connect-timeout", "30", "--max-time", "1800",
                     "--progress-bar",
                     "-o", destination.path, packageURL.absoluteString
@@ -636,6 +654,16 @@ public final class EnvironmentManager: ObservableObject {
         }
 
         try await waitForXServer(xhost: xhost, timeout: 30)
+
+        let tcpDeadline = Date().addingTimeInterval(10)
+        var tcpReady = await isTCPDisplayListening()
+        while !tcpReady, Date() < tcpDeadline {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            tcpReady = await isTCPDisplayListening()
+        }
+        if !tcpReady {
+            log.append("XQuartz 未监听 TCP:6000，容器内应用可能无法显示窗口", level: .warning)
+        }
 
         // A connection from the container arrives as 127.0.0.1 through Colima's
         // user-mode networking, so a single allow rule is enough.
@@ -941,23 +969,13 @@ public final class EnvironmentManager: ObservableObject {
     }
 
     public func stopColima(reason: String = "手动") async {
-        guard let colima = tools.colima else { return }
-        activityMessage = "正在停止 Colima…"
-        defer { activityMessage = nil }
-
-        log.append("正在停止 Colima（\(reason)）", level: .info)
-        let logStore = log
-        _ = try? await runner.run(
-            colima,
-            ["stop"],
-            options: RunOptions(timeout: 240),
-            onLine: { line in logStore.append(line) }
-        )
-        colimaState = .stopped
-        containerState = .stopped
-        stats = RuntimeStats()
-        idleSince = nil
-        log.append("Colima 已停止", level: .success)
+        guard tools.colima != nil else { return }
+        do {
+            try await stopColimaChecked(reason: reason)
+        } catch {
+            log.append("Colima 停止失败：\(error.localizedDescription)", level: .error)
+            await refreshColimaState()
+        }
     }
 
     /// Convenience used by the UI and the wrapper generator flows.

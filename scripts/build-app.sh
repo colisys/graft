@@ -34,19 +34,20 @@ if [ -z "$BIN_PATH" ] || [ ! -x "$BIN_PATH/Graft" ]; then
 fi
 
 APP="$ROOT/dist/Graft.app"
-rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+STAGE="$ROOT/dist/.Graft.app.stage"
+rm -rf "$STAGE"
+mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
 
-cp "$BIN_PATH/Graft" "$APP/Contents/MacOS/Graft"
-cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
-cp "$ROOT/LICENSE" "$APP/Contents/Resources/LICENSE"
+cp "$BIN_PATH/Graft" "$STAGE/Contents/MacOS/Graft"
+cp "$ROOT/Resources/Info.plist" "$STAGE/Contents/Info.plist"
+cp "$ROOT/LICENSE" "$STAGE/Contents/Resources/LICENSE"
 
 # Native launcher embedded into generated .app wrappers. It makes LaunchServices
 # see a real AppKit executable instead of a shell script, so the Dock icon
 # stops bouncing after the app finishes launching.
 if [ -x "$BIN_PATH/GraftLauncher" ]; then
-    cp "$BIN_PATH/GraftLauncher" "$APP/Contents/Resources/GraftLauncher"
-    chmod 0755 "$APP/Contents/Resources/GraftLauncher"
+    cp "$BIN_PATH/GraftLauncher" "$STAGE/Contents/Resources/GraftLauncher"
+    chmod 0755 "$STAGE/Contents/Resources/GraftLauncher"
 else
     echo "warning: GraftLauncher was not built; generated apps will use shell launchers." >&2
 fi
@@ -54,13 +55,16 @@ fi
 # Copy any SwiftPM resource bundles produced for GraftCore.
 for bundle in "$BIN_PATH"/*.bundle; do
     if [ -e "$bundle" ]; then
-        cp -R "$bundle" "$APP/Contents/Resources/"
+        cp -R "$bundle" "$STAGE/Contents/Resources/"
     fi
 done
 
 # Ad-hoc signing keeps macOS happy on the local machine. Distribution builds
 # should use a Developer ID certificate and notarization.
-codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || true
+codesign --force --deep --sign - "$STAGE" >/dev/null 2>&1 || true
+
+rm -rf "$APP"
+mv "$STAGE" "$APP"
 
 echo "Built: $APP"
 echo "Architecture: $(lipo -archs "$APP/Contents/MacOS/Graft" 2>/dev/null || file -b "$APP/Contents/MacOS/Graft")"

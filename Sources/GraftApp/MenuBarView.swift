@@ -35,18 +35,6 @@ struct MenuBarView: View {
         }
         .padding(16)
         .frame(width: 340)
-
-        .alert("出错了", isPresented: $model.showingError) {
-            if model.shouldOfferRuntimeRecovery {
-                Button("启动运行环境") {
-                    Task { await model.requestStartRuntime() }
-                }
-                .disabled(model.isBusy || model.isActionPending)
-            }
-            Button("好", role: .cancel) {}
-        } message: {
-            Text(model.errorMessage ?? "未知错误")
-        }
     }
 
     private var header: some View {

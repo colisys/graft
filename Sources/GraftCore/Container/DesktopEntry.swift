@@ -53,7 +53,7 @@ public struct DesktopEntry: Identifiable, Hashable, Sendable {
 
     /// `Exec` split into argv, with field codes and quoting resolved.
     public var execTokens: [String] {
-        DesktopExecParser.tokenize(exec)
+        DesktopExecParser.tokenize(exec, name: name, iconName: iconName, filePath: filePath)
     }
 
     /// The actual binary basename (skips `env FOO=bar` prefixes).
@@ -226,7 +226,12 @@ public enum DesktopExecParser {
         "f", "F", "u", "U", "d", "D", "n", "N", "i", "c", "k", "v", "m"
     ]
 
-    public static func tokenize(_ exec: String) -> [String] {
+    public static func tokenize(
+        _ exec: String,
+        name: String? = nil,
+        iconName: String? = nil,
+        filePath: String? = nil
+    ) -> [String] {
         var tokens: [String] = []
         var current = ""
         var hasToken = false
@@ -261,6 +266,30 @@ public enum DesktopExecParser {
                     }
                     if fieldCodes.contains(next) {
                         index += 2
+                        switch next {
+                        case "i":
+                            if let iconName, !iconName.isEmpty {
+                                if hasToken {
+                                    tokens.append(current)
+                                    current = ""
+                                    hasToken = false
+                                }
+                                tokens.append("--icon")
+                                tokens.append(iconName)
+                            }
+                        case "c":
+                            if let name, !name.isEmpty {
+                                current.append(name)
+                                hasToken = true
+                            }
+                        case "k":
+                            if let filePath, !filePath.isEmpty {
+                                current.append(filePath)
+                                hasToken = true
+                            }
+                        default:
+                            break
+                        }
                         continue
                     }
                 }

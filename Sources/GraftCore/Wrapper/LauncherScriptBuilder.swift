@@ -79,6 +79,7 @@ public enum LauncherScriptBuilder {
         XHOST=\(quote(configuration.tools.xhost ?? ""))
         XQUARTZ=\(quote(configuration.xquartzAppPath ?? ""))
         CONTAINER=\(quote(configuration.containerName))
+        IMAGE=\(quote(configuration.baseImage.imageName))
         DISPLAY_HOST=\(quote(configuration.display))
         SESSION_DIR=\(quote(configuration.sessionDirectory))
         SESSION_ID=\(quote(sessionID))
@@ -131,6 +132,11 @@ public enum LauncherScriptBuilder {
             "$DOCKER" start "$CONTAINER" >/dev/null || { echo "ERROR: container start failed"; exit 1; }
           fi
         else
+          if ! "$DOCKER" image inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "ERROR: base image $IMAGE is missing. Open Graft and start the runtime to rebuild it."
+            /usr/bin/osascript -e 'display notification "缺少基础镜像，请打开 Graft 启动运行环境" with title "Graft"' >/dev/null 2>&1 || true
+            exit 1
+          fi
           echo "Creating container $CONTAINER (first run)..."
           "$DOCKER" \(runArguments) || { echo "ERROR: container creation failed"; exit 1; }
           state=false
@@ -143,6 +149,8 @@ public enum LauncherScriptBuilder {
             /bin/sleep 1
           done
         fi
+
+        [ "$state" = "true" ] || { echo "ERROR: container did not become ready: $CONTAINER"; exit 1; }
 
         # 4. Mark the session and launch the Linux process.
         printf '%s\\t%s\\t%s\\n' "$$" "$(date +%s)" "$NAME" > "$SESSION_FILE"
@@ -159,9 +167,21 @@ public enum LauncherScriptBuilder {
         #    reflects a running application.
         if [ -n "$PNAME" ]; then
           PNAME_SHORT=${PNAME:0:15}
-          while "$DOCKER" exec "$CONTAINER" pgrep -u graft -x "$PNAME_SHORT" >/dev/null 2>&1; do
-            /bin/sleep 2
+          seen=0
+          for _ in $(/usr/bin/seq 1 60); do
+            if "$DOCKER" exec "$CONTAINER" pgrep -u graft -x "$PNAME_SHORT" >/dev/null 2>&1; then
+              seen=1
+              break
+            fi
+            /bin/sleep 1
           done
+          if [ "$seen" = "1" ]; then
+            while "$DOCKER" exec "$CONTAINER" pgrep -u graft -x "$PNAME_SHORT" >/dev/null 2>&1; do
+              /bin/sleep 2
+            done
+          else
+            echo "WARNING: process $PNAME_SHORT did not appear within 60s"
+          fi
         fi
 
         echo "Application exited."

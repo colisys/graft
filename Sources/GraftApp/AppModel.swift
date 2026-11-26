@@ -80,8 +80,8 @@ final class AppModel: ObservableObject {
         migrateLegacyWrappers()
         backfillInstallations()
         if environment.colimaState == .running {
-            await reloadContainerEntries()
             await reloadContainers()
+            await reloadContainerEntries()
         }
     }
 
@@ -137,7 +137,7 @@ final class AppModel: ObservableObject {
             ensureMainMenuForRegularActivation()
         }
 
-        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
         NSApp.activate(ignoringOtherApps: true)
         managementWindow?.makeKeyAndOrderFront(nil)
         managementWindow?.orderFrontRegardless()
@@ -147,7 +147,7 @@ final class AppModel: ObservableObject {
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 250_000_000)
             guard let self, let window = self.managementWindow else { return }
-            NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+            NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
             window.makeKeyAndOrderFront(nil)
             window.orderFrontRegardless()
         }
@@ -291,11 +291,11 @@ final class AppModel: ObservableObject {
         await environment.refresh()
         wrappedApps = Self.scanWrappedApps()
         backfillInstallations()
+        containerEntries = []
         if environment.colimaState == .running {
-            await reloadContainerEntries()
             await reloadContainers()
+            await reloadContainerEntries()
         } else {
-            containerEntries = []
             containers = []
         }
         showToast("状态已刷新")
@@ -344,8 +344,16 @@ final class AppModel: ObservableObject {
     }
 
     private func reloadContainerEntries() async {
+        containerEntries = []
+        guard containers.contains(where: {
+            $0.name == environment.currentContainerName && $0.isRunning
+        }) else { return }
+        let containerName = environment.currentContainerName
         do {
-            containerEntries = try await orchestrator.listDesktopEntries()
+            let entries = try await orchestrator.listDesktopEntries()
+            if environment.currentContainerName == containerName {
+                containerEntries = entries
+            }
         } catch {
             log.append("读取容器应用列表失败：\(error.localizedDescription)", level: .warning)
         }
@@ -413,8 +421,9 @@ final class AppModel: ObservableObject {
             try await self.environment.configureXQuartz()
             try await self.environment.ensureColimaRunning()
             try await self.orchestrator.prepare()
-            self.containerEntries = try await self.orchestrator.listDesktopEntries()
             await self.environment.refresh()
+            await self.reloadContainers()
+            await self.reloadContainerEntries()
         }
     }
 
@@ -439,6 +448,7 @@ final class AppModel: ObservableObject {
             }
             await self.environment.refresh()
             await self.reloadContainers()
+            await self.reloadContainerEntries()
         }
     }
 
@@ -654,7 +664,11 @@ final class AppModel: ObservableObject {
                 return stem.contains(needle) || entry.executableToken.lowercased().contains(needle)
             }
             for entry in matches {
-                _ = try? await self.wrap(entry, base: base, using: target)
+                do {
+                    _ = try await self.wrap(entry, base: base, using: target)
+                } catch {
+                    self.log.append("封装 \(entry.name) 失败：\(error.localizedDescription)", level: .warning)
+                }
             }
             await self.environment.refresh()
             self.wrappedApps = Self.scanWrappedApps()
@@ -731,7 +745,7 @@ final class AppModel: ObservableObject {
         alert.addButton(withTitle: "同意并继续")
         alert.addButton(withTitle: "取消")
 
-        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
         NSApp.activate(ignoringOtherApps: true)
 
         isActionPending = true
@@ -786,10 +800,20 @@ final class AppModel: ObservableObject {
     func wrapAllEntries() async {
         guard !containerEntries.isEmpty else { return }
         await perform("正在封装 \(containerEntries.count) 个应用…") {
+            var failures: [String] = []
             for entry in self.containerEntries {
-                _ = try? await self.wrap(entry)
+                do {
+                    _ = try await self.wrap(entry)
+                } catch {
+                    failures.append("\(entry.name)：\(error.localizedDescription)")
+                }
             }
             self.wrappedApps = Self.scanWrappedApps()
+            guard failures.isEmpty else {
+                throw GraftError.installFailed(
+                    "有 \(failures.count) 个应用封装失败：\n" + failures.joined(separator: "\n")
+                )
+            }
         }
     }
 
@@ -866,7 +890,7 @@ final class AppModel: ObservableObject {
     private func trackDirectLaunch(_ entry: DesktopEntry) {
         let processName = entry.executableToken
         let marker = SessionRegistry.createMarker(
-            id: "inline-\(processName)",
+            id: "inline-\(processName)-\(UUID().uuidString.prefix(8))",
             appName: entry.name
         )
 
@@ -903,6 +927,10 @@ final class AppModel: ObservableObject {
     func remove(_ app: WrappedApp) {
         do {
             try FileManager.default.removeItem(at: app.bundleURL)
+            for record in installations where record.bundlePath == app.bundleURL.path {
+                InstallationRegistry.shared.remove(id: record.id)
+            }
+            installations = InstallationRegistry.shared.all()
             log.append("已删除 \(app.name).app", level: .info)
             showToast("已删除 \(app.name).app")
         } catch {
@@ -980,9 +1008,14 @@ final class AppModel: ObservableObject {
         environment.noteActivity()
     }
 
+    func dismissError() {
+        errorMessage = nil
+    }
+
     private func present(_ error: Error) {
         let message = error.localizedDescription
         errorMessage = message
+        showManagementWindow()
         showingError = true
         showToast("操作失败：\(message)")
         log.append(message, level: .error)
@@ -1048,6 +1081,7 @@ final class AppModel: ObservableObject {
     func refreshContainersNow() async {
         await perform("正在刷新容器列表…") {
             await self.reloadContainers()
+            await self.reloadContainerEntries()
         }
     }
 
@@ -1056,6 +1090,7 @@ final class AppModel: ObservableObject {
             try await self.orchestrator.startContainer(named: container.name)
             await self.environment.refresh()
             await self.reloadContainers()
+            await self.reloadContainerEntries()
         }
     }
 
@@ -1064,6 +1099,7 @@ final class AppModel: ObservableObject {
             try await self.orchestrator.stopContainer(named: container.name)
             await self.environment.refresh()
             await self.reloadContainers()
+            await self.reloadContainerEntries()
         }
     }
 
@@ -1095,6 +1131,7 @@ final class AppModel: ObservableObject {
             self.wrappedApps = Self.scanWrappedApps()
             await self.environment.refresh()
             await self.reloadContainers()
+            await self.reloadContainerEntries()
         }
     }
 
@@ -1122,9 +1159,9 @@ final class AppModel: ObservableObject {
             let target = self.orchestrator(for: base)
             let containerExists = self.containers.contains { $0.name == target.containerName }
             if self.environment.colimaState == .running && containerExists {
-                try? await target.uninstall(preset, progress: progress)
+                try await target.uninstall(preset, progress: progress)
             } else {
-                self.log.append("容器 \(target.containerName) 未运行，仅移除 .app 封装。", level: .warning)
+                self.log.append("容器 \(target.containerName) 不存在或未运行，仅移除 .app 封装。", level: .warning)
             }
 
             var bundlePaths = Set<String>()
@@ -1136,8 +1173,8 @@ final class AppModel: ObservableObject {
                 && self.matchesPreset(app, preset) {
                 bundlePaths.insert(app.bundleURL.path)
             }
-            for path in bundlePaths {
-                try? FileManager.default.removeItem(atPath: path)
+            for path in bundlePaths where FileManager.default.fileExists(atPath: path) {
+                try FileManager.default.removeItem(atPath: path)
             }
             InstallationRegistry.shared.remove(
                 presetID: preset.id,

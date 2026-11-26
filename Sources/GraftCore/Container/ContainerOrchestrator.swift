@@ -180,7 +180,9 @@ public final class ContainerOrchestrator: @unchecked Sendable {
                 let image = fields.count > 2 ? fields[2] : ""
                 let status = fields.count > 3 ? fields[3] : ""
                 let size = fields.count > 4 ? fields[4] : ""
-                let base = BaseImage.allCases.first { $0.containerName == name }
+                let base = BaseImage.allCases
+                    .filter { name == $0.containerName || name.hasPrefix($0.containerName + "-") }
+                    .max { $0.containerName.count < $1.containerName.count }
                 return DockerContainerInfo(
                     name: name,
                     state: state,
@@ -538,29 +540,29 @@ public final class ContainerOrchestrator: @unchecked Sendable {
         switch strategy {
         case .apt(let packages), .mozillaRepository(let packages):
             let names = packages.map(ShellQuote.quote).joined(separator: " ")
-            _ = try? await runAsRoot(
+            try await runAsRoot(
                 "export DEBIAN_FRONTEND=noninteractive; apt-get remove -y \(names)",
                 timeout: 600
             )
         case .directDeb(_, _, let packageName):
-            _ = try? await runAsRoot(
+            try await runAsRoot(
                 "export DEBIAN_FRONTEND=noninteractive; apt-get remove -y \(ShellQuote.quote(packageName))",
                 timeout: 600
             )
         case .firefoxTarball:
-            _ = try? await runAsRoot(
+            try await runAsRoot(
                 "rm -rf /opt/firefox /usr/local/bin/firefox /usr/share/applications/firefox.desktop /usr/share/pixmaps/firefox.png",
                 timeout: 120
             )
         case .pacman(let packages):
             let names = packages.map(ShellQuote.quote).joined(separator: " ")
-            _ = try? await runAsRoot("pacman -R --noconfirm \(names)", timeout: 600)
+            try await runAsRoot("pacman -R --noconfirm \(names)", timeout: 600)
         case .dnf(let packages):
             let names = packages.map(ShellQuote.quote).joined(separator: " ")
-            _ = try? await runAsRoot("dnf -y --setopt=clean_requirements_on_remove=False remove \(names)", timeout: 600)
+            try await runAsRoot("dnf -y --setopt=clean_requirements_on_remove=False remove \(names)", timeout: 600)
         case .apk(let packages):
             let names = packages.map(ShellQuote.quote).joined(separator: " ")
-            _ = try? await runAsRoot("apk del \(names)", timeout: 600)
+            try await runAsRoot("apk del \(names)", timeout: 600)
         }
 
         log.append("\(preset.name) 已从 \(baseImage.displayName) 容器卸载", level: .success)
@@ -687,7 +689,7 @@ public final class ContainerOrchestrator: @unchecked Sendable {
             throw GraftError.installFailed("\(baseImage.displayName) 不使用 .deb 安装包。")
         }
         guard let curl = toolbox.tools.curl else {
-            throw GraftError.missingDependency(.homebrew)
+            throw GraftError.commandFailed("未找到 curl，无法下载 \(name)。")
         }
         let docker = try requireDocker()
 
@@ -710,7 +712,7 @@ public final class ContainerOrchestrator: @unchecked Sendable {
             do {
                 let download = try await runner.run(
                     curl,
-                    ["-fL", "--retry", "2", "--retry-delay", "2",
+                    ["-fL", "--retry", "3", "--retry-delay", "2", "--retry-all-errors",
                      "--connect-timeout", "30", "--max-time", "600",
                      "--silent", "--show-error", "-o", localURL.path, source],
                     options: RunOptions(timeout: 660),

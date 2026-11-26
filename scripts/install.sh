@@ -34,8 +34,11 @@ if pgrep -x Graft >/dev/null 2>&1; then
     sleep 0.3
 fi
 
+STAGE="$INSTALL_DIR/.Graft.app.stage"
+rm -rf "$STAGE"
+ditto "$SOURCE_APP" "$STAGE"
 rm -rf "$TARGET"
-ditto "$SOURCE_APP" "$TARGET"
+mv "$STAGE" "$TARGET"
 
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 if [ -x "$LSREGISTER" ]; then

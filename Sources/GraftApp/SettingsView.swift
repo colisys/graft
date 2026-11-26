@@ -97,7 +97,10 @@ struct SettingsView: View {
                 Text("默认环境").tag("")
                 ForEach(model.containers.compactMap { container -> String? in
                     let prefix = environment.baseImage.containerName + "-"
-                    return container.name.hasPrefix(prefix) ? String(container.name.dropFirst(prefix.count)) : nil
+                    guard container.name.hasPrefix(prefix),
+                          !BaseImage.allCases.contains(where: { $0.containerName == container.name })
+                    else { return nil }
+                    return String(container.name.dropFirst(prefix.count))
                 }.sorted(), id: \.self) { name in
                     Text(name).tag(name)
                 }

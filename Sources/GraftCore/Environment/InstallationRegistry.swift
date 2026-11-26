@@ -104,8 +104,18 @@ public final class InstallationRegistry: @unchecked Sendable {
     }
 
     private func load() {
-        guard let data = try? Data(contentsOf: fileURL) else { return }
-        records = (try? JSONDecoder().decode([InstalledApplication].self, from: data)) ?? []
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: fileURL.path),
+              let data = try? Data(contentsOf: fileURL) else { return }
+        do {
+            records = try JSONDecoder().decode([InstalledApplication].self, from: data)
+        } catch {
+            let backup = fileURL.deletingPathExtension()
+                .appendingPathExtension("corrupt.json")
+            try? fileManager.removeItem(at: backup)
+            try? fileManager.copyItem(at: fileURL, to: backup)
+            records = []
+        }
     }
 
     private func saveLocked() {

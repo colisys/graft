@@ -95,6 +95,9 @@ struct ManagementView: View {
         .onChange(of: environment.environmentName) { _ in
             Task { await model.refresh() }
         }
+        .onChange(of: model.showingError) { shown in
+            if !shown { model.dismissError() }
+        }
         .alert("出错了", isPresented: $model.showingError) {
             if model.shouldOfferRuntimeRecovery {
                 Button("启动运行环境") {

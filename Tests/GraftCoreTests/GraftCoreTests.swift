@@ -119,6 +119,18 @@ final class DesktopExecParserTests: XCTestCase {
         )
         XCTAssertEqual(entry.executableToken, "x-app")
     }
+
+    func testExpandsContextualFieldCodes() {
+        XCTAssertEqual(
+            DesktopExecParser.tokenize("app %c %k", name: "My App", filePath: "/tmp/x.desktop"),
+            ["app", "My App", "/tmp/x.desktop"]
+        )
+        XCTAssertEqual(
+            DesktopExecParser.tokenize("app %i", iconName: "myicon"),
+            ["app", "--icon", "myicon"]
+        )
+        XCTAssertEqual(DesktopExecParser.tokenize("app %i"), ["app"])
+    }
 }
 
 final class ShellQuoteTests: XCTestCase {
@@ -186,6 +198,8 @@ final class LauncherScriptBuilderTests: XCTestCase {
         XCTAssertTrue(script.contains("dbus-run-session"))
         XCTAssertTrue(script.contains("SESSION_FILE"))
         XCTAssertTrue(script.contains("PNAME_SHORT"))
+        XCTAssertTrue(script.contains("container did not become ready"))
+        XCTAssertTrue(script.contains("did not appear within 60s"))
     }
 
     func testInjectionIsQuoted() {
