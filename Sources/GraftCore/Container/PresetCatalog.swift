@@ -15,6 +15,8 @@ public enum InstallStrategy: Hashable, Sendable {
     case pacman([String])
     /// Alpine apk package(s).
     case apk([String])
+    /// RPM package(s) from the base image's DNF repositories.
+    case dnf([String])
 }
 
 /// A one-click installable Linux desktop application.
@@ -59,6 +61,23 @@ public struct PresetApp: Identifiable, Hashable, Sendable {
     }
 }
 
+/// Optional HTTPS URL template for a user-selected VS Code download CDN.
+public enum VSCodeDownloadSource {
+    public static let defaultsKey = "graft.vsCodeDownloadTemplate"
+
+    public static func url(template: String, architecture: HostArchitecture) -> String? {
+        let value = template.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard value.contains("{arch}"),
+              let parsed = URLComponents(string: value),
+              parsed.scheme?.lowercased() == "https",
+              parsed.host != nil,
+              parsed.user == nil,
+              parsed.password == nil else { return nil }
+        let arch = architecture == .arm64 ? "arm64" : "x64"
+        return value.replacingOccurrences(of: "{arch}", with: arch)
+    }
+}
+
 public enum PresetCatalog {
     private static let vsCodePackageURLs = (
         arm64: "https://update.code.visualstudio.com/latest/linux-deb-arm64/stable",
@@ -86,7 +105,7 @@ public enum PresetCatalog {
         PresetApp(
             id: "firefox",
             name: "Firefox",
-            summary: "官方 tar.xz 压缩包（Debian/Ubuntu）或发行版原生包（Arch/Alpine）。",
+            summary: "官方 tar.xz 压缩包（Debian/Ubuntu）或发行版原生包（Arch/Alpine/Rocky）。",
             symbolName: "globe",
             installs: [
                 .ubuntu: .firefoxTarball(
@@ -98,7 +117,8 @@ public enum PresetCatalog {
                     amd64: firefoxPackageURLs.amd64
                 ),
                 .arch: .pacman(["firefox"]),
-                .alpine: .apk(["firefox"])
+                .alpine: .apk(["firefox"]),
+                                .rocky: .dnf(["firefox"])
             ],
             desktopHints: ["firefox"]
         ),
@@ -111,7 +131,8 @@ public enum PresetCatalog {
                 .ubuntu: .apt(["gimp"]),
                 .debian: .apt(["gimp"]),
                 .arch: .pacman(["gimp"]),
-                .alpine: .apk(["gimp"])
+                .alpine: .apk(["gimp"]),
+                                .rocky: .dnf(["gimp"])
             ],
             desktopHints: ["gimp"]
         ),
@@ -124,7 +145,8 @@ public enum PresetCatalog {
                 .ubuntu: .apt(["inkscape"]),
                 .debian: .apt(["inkscape"]),
                 .arch: .pacman(["inkscape"]),
-                .alpine: .apk(["inkscape"])
+                .alpine: .apk(["inkscape"]),
+                                .rocky: .dnf(["inkscape"])
             ],
             desktopHints: ["inkscape"]
         ),
@@ -143,7 +165,7 @@ public enum PresetCatalog {
         PresetApp(
             id: "vlc",
             name: "VLC",
-            summary: "全能媒体播放器；各发行版均提供原生包。",
+            summary: "全能媒体播放器；Ubuntu / Debian / Arch / Alpine 使用原生包。",
             symbolName: "play.rectangle",
             installs: [
                 .ubuntu: .apt(["vlc"]),

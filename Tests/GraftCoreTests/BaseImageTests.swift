@@ -8,6 +8,22 @@ final class BaseImageTests: XCTestCase {
         XCTAssertEqual(Set(BaseImage.allCases.map(\.homeVolumeName)).count, BaseImage.allCases.count)
     }
 
+    func testNamedEnvironmentsUseSeparateContainersAndVolumes() {
+        let settings = RuntimeSettings()
+        settings.baseImage = .rocky
+        let orchestrator = ContainerOrchestrator(log: LogStore(), runtimeSettings: settings)
+        XCTAssertEqual(orchestrator.containerName, "graft-runtime-rocky")
+        XCTAssertEqual(orchestrator.homeVolumeName, "graft-home-rocky")
+        settings.environmentName = "work"
+        XCTAssertEqual(orchestrator.containerName, "graft-runtime-rocky-work")
+        XCTAssertEqual(orchestrator.homeVolumeName, "graft-home-rocky-work")
+        let args = orchestrator.containerRunArguments()
+        XCTAssertTrue(args.contains("graft-runtime-rocky-work"))
+        XCTAssertTrue(args.contains("graft-home-rocky-work:/home/graft"))
+        settings.environmentName = "personal"
+        XCTAssertEqual(orchestrator.containerName, "graft-runtime-rocky-personal")
+    }
+
     func testUbuntuKeepsLegacyNames() {
         XCTAssertEqual(BaseImage.ubuntu.containerName, "graft-runtime")
         XCTAssertEqual(BaseImage.ubuntu.imageName, "graft/ubuntu-desktop:24.04")
@@ -19,6 +35,8 @@ final class BaseImageTests: XCTestCase {
         XCTAssertEqual(BaseImage.debian.packageManager, .apt)
         XCTAssertEqual(BaseImage.arch.packageManager, .pacman)
         XCTAssertEqual(BaseImage.alpine.packageManager, .apk)
+        XCTAssertEqual(BaseImage.rocky.packageManager, .dnf)
+        XCTAssertEqual(BaseImage.rocky.packageManager.installCommandName, "dnf install")
     }
 
     func testDockerfileTemplatesUseTheirPackageManager() {
@@ -38,6 +56,15 @@ final class BaseImageTests: XCTestCase {
         }
     }
 
+    func testDesktopImagesIncludeIconThemesAndSVGSupport() {
+        for base in BaseImage.allCases {
+            let dockerfile = base.defaultDockerfile
+            XCTAssertTrue(dockerfile.contains("adwaita-icon-theme"), "Missing GTK icons in \(base.rawValue)")
+            XCTAssertTrue(dockerfile.contains("hicolor-icon-theme"), "Missing fallback icons in \(base.rawValue)")
+            XCTAssertTrue(dockerfile.contains("librsvg"), "Missing SVG icon loader in \(base.rawValue)")
+        }
+    }
+
     func testPresetSupportDiffersByBase() throws {
         let vscode = try XCTUnwrap(PresetCatalog.preset(id: "vscode"))
         XCTAssertNotNil(vscode.strategy(for: .ubuntu))
@@ -49,6 +76,20 @@ final class BaseImageTests: XCTestCase {
         for base in BaseImage.allCases {
             XCTAssertNotNil(firefox.strategy(for: base), "Firefox should support \(base.rawValue)")
         }
+    }
+
+    func testRockyUsesNativeRPMAndNamespacedImage() throws {
+        let base = BaseImage.rocky
+        XCTAssertFalse(base.isDebianBased)
+        XCTAssertTrue(base.defaultDockerfile.hasPrefix("FROM rockylinux/rockylinux:9\n"))
+        XCTAssertTrue(base.defaultDockerfile.contains("dnf install"))
+        XCTAssertTrue(base.dockerfile(registryMirror: "mirror.example.com")
+            .hasPrefix("FROM mirror.example.com/rockylinux/rockylinux:9\n"))
+        for id in ["firefox", "gimp", "inkscape"] {
+            let preset = try XCTUnwrap(PresetCatalog.preset(id: id))
+            XCTAssertEqual(preset.strategy(for: base), .dnf([id]))
+        }
+        XCTAssertNil(PresetCatalog.preset(id: "vscode")?.strategy(for: base))
     }
 
     func testAlpineIsMarkedNonElectron() {
@@ -160,6 +201,28 @@ final class BaseImageTests: XCTestCase {
         XCTAssertTrue(migratedScript.contains("/usr/bin/open -g -a"))
         let launcherData = try Data(contentsOf: legacyLauncher)
         XCTAssertFalse(launcherData.starts(with: Data("#!".utf8)))
+    }
+
+    @MainActor
+    func testDisplayScalePreservesDefaultAndOnlyChangesNewLaunchTokens() {
+        let settings = RuntimeSettings()
+        let orchestrator = ContainerOrchestrator(log: LogStore(), runtimeSettings: settings)
+        let gimp = DesktopEntry(filePath: "/usr/share/applications/gimp.desktop", name: "GIMP", exec: "gimp %F")
+        let code = DesktopEntry(filePath: "/usr/share/applications/code.desktop", name: "Code", exec: "code %F")
+
+        XCTAssertFalse(orchestrator.applicationTokens(for: gimp).contains("GDK_SCALE=2"))
+        XCTAssertFalse(orchestrator.applicationTokens(for: code).contains("--force-device-scale-factor=2"))
+
+        settings.displayScale = 2
+        let gimpTokens = orchestrator.applicationTokens(for: gimp)
+        XCTAssertEqual(Array(gimpTokens.prefix(5)), ["dbus-run-session", "--", "env", "GDK_SCALE=2", "QT_SCALE_FACTOR=2"])
+        XCTAssertFalse(gimpTokens.contains("--force-device-scale-factor=2"))
+        let codeTokens = orchestrator.applicationTokens(for: code)
+        XCTAssertTrue(codeTokens.contains("--force-device-scale-factor=2"))
+        XCTAssertFalse(codeTokens.contains("GDK_SCALE=2"))
+        XCTAssertTrue(codeTokens.contains("--disable-gpu"))
+        settings.displayScale = 1
+        XCTAssertFalse(orchestrator.applicationTokens(for: code).contains("GDK_SCALE=2"))
     }
 
     @MainActor

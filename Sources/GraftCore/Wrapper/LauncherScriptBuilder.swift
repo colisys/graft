@@ -133,13 +133,16 @@ public enum LauncherScriptBuilder {
         else
           echo "Creating container $CONTAINER (first run)..."
           "$DOCKER" \(runArguments) || { echo "ERROR: container creation failed"; exit 1; }
+          state=false
         fi
 
-        for _ in $(/usr/bin/seq 1 90); do
-          state=$("$DOCKER" inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || echo false)
-          [ "$state" = "true" ] && break
-          /bin/sleep 1
-        done
+        if [ "$state" != "true" ]; then
+          for _ in $(/usr/bin/seq 1 90); do
+            state=$("$DOCKER" inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || echo false)
+            [ "$state" = "true" ] && break
+            /bin/sleep 1
+          done
+        fi
 
         # 4. Mark the session and launch the Linux process.
         printf '%s\\t%s\\t%s\\n' "$$" "$(date +%s)" "$NAME" > "$SESSION_FILE"

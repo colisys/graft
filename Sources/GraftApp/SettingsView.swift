@@ -5,14 +5,17 @@ import GraftCore
 struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var environment: EnvironmentManager
+    @State private var newEnvironmentName = ""
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 baseImagePanel
+                environmentsPanel
                 containersPanel
                 colimaResourcesPanel
                 dockerRegistryPanel
+                vsCodeCDNPanel
                 performancePanel
                 packageManagerPanel
                 dependenciesPanel
@@ -27,6 +30,18 @@ struct SettingsView: View {
             }
             .padding(EdgeInsets(top: 0, leading: 22, bottom: 22, trailing: 22))
         }
+        .onChange(of: environment.baseImage) { _ in model.notifySettingChanged("基础镜像") }
+        .onChange(of: environment.environmentName) { _ in model.notifySettingChanged("当前环境") }
+        .onChange(of: environment.colimaCPU) { _ in model.notifySettingChanged("Colima CPU") }
+        .onChange(of: environment.colimaMemoryGB) { _ in model.notifySettingChanged("Colima 内存") }
+        .onChange(of: environment.electronGPUEnabled) { _ in model.notifySettingChanged("GPU 合成设置") }
+        .onChange(of: environment.displayScale) { _ in model.notifySettingChanged("Linux 应用缩放") }
+        .onChange(of: environment.xquartzIGLXEnabled) { _ in model.notifySettingChanged("XQuartz GLX 设置") }
+        .onChange(of: environment.dockerRegistryMirror) { _ in model.notifySettingChanged("镜像源") }
+        .onChange(of: model.vsCodeDownloadTemplate) { _ in model.notifySettingChanged("VS Code 下载源") }
+        .onChange(of: environment.packageManagerPreference) { _ in model.notifySettingChanged("包管理器") }
+        .onChange(of: environment.autoSuspendEnabled) { _ in model.notifySettingChanged("自动休眠设置") }
+        .onChange(of: environment.idleTimeout) { _ in model.notifySettingChanged("空闲等待时间") }
     }
 
     // MARK: - Base image
@@ -40,7 +55,7 @@ struct SettingsView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .disabled(model.isBusy)
+            .disabled(model.isBusy || model.isActionPending)
 
             HStack(spacing: 8) {
                 Text(environment.baseImage.displayName)
@@ -75,6 +90,36 @@ struct SettingsView: View {
         }
     }
 
+    private var environmentsPanel: some View {
+        panel("隔离环境", subtitle: "从当前基础镜像新建容器，每个环境有独立的 home 数据卷；默认环境保持原有数据。") {
+            Picker("当前环境", selection: $environment.environmentName) {
+                Text("默认环境").tag("")
+                ForEach(model.containers.compactMap { container -> String? in
+                    let prefix = environment.baseImage.containerName + "-"
+                    return container.name.hasPrefix(prefix) ? String(container.name.dropFirst(prefix.count)) : nil
+                }.sorted(), id: \.self) { name in
+                    Text(name).tag(name)
+                }
+            }
+            .disabled(model.isBusy || model.isActionPending)
+            HStack {
+                TextField("新环境名称（字母、数字、连字符）", text: $newEnvironmentName)
+                    .textFieldStyle(.roundedBorder)
+                Button("从镜像新建") {
+                    let name = newEnvironmentName
+                    Task {
+                        await model.createEnvironment(named: name)
+                        newEnvironmentName = ""
+                    }
+                }
+                .disabled(model.isBusy || model.isActionPending || newEnvironmentName.isEmpty)
+            }
+            Text("当前容器：\(environment.currentContainerName)。切换环境只影响后续操作，不会迁移已安装的软件。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+    }
+
     // MARK: - Containers
 
     private var containersPanel: some View {
@@ -88,22 +133,22 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button("刷新") {
-                    Task { await model.refreshContainersNow() }
+                    Task { await model.refresh() }
                 }
                 .controlSize(.small)
-                .disabled(model.isBusy)
+                .disabled(model.isBusy || model.isActionPending)
                 if environment.colimaState == .running {
                     Button("停止 Colima") {
                         Task { await model.suspendRuntime() }
                     }
                     .controlSize(.small)
-                    .disabled(model.isBusy)
+                    .disabled(model.isBusy || model.isActionPending)
                 } else {
                     Button("启动 Colima") {
                         Task { await model.requestStartRuntime() }
                     }
                     .controlSize(.small)
-                    .disabled(model.isBusy)
+                    .disabled(model.isBusy || model.isActionPending)
                 }
             }
 
@@ -161,14 +206,14 @@ struct SettingsView: View {
                     }
                 }
                 .controlSize(.small)
-                .disabled(model.isBusy || environment.colimaState != .running)
+                .disabled(model.isBusy || model.isActionPending || environment.colimaState != .running)
                 Button(role: .destructive) {
                     Task { await model.removeContainer(container) }
                 } label: {
                     Image(systemName: "trash")
                 }
                 .buttonStyle(.borderless)
-                .disabled(model.isBusy || environment.colimaState != .running)
+                .disabled(model.isBusy || model.isActionPending || environment.colimaState != .running)
                 .help("删除容器")
             }
 
@@ -193,7 +238,7 @@ struct SettingsView: View {
     private var colimaResourcesPanel: some View {
         panel(
             "Colima 资源",
-            subtitle: "内存/CPU 不足会明显卡顿；修改后需休眠并重新启动 Colima。"
+            subtitle: "内存/CPU 不足会明显卡顿；修改后点击重启 Colima 应用设置。"
         ) {
             HStack(spacing: 10) {
                 Text("CPU")
@@ -203,7 +248,7 @@ struct SettingsView: View {
                     value: $environment.colimaCPU,
                     in: 2...environment.maxColimaCPU
                 )
-                .disabled(model.isBusy)
+                .disabled(model.isBusy || model.isActionPending)
                 Spacer()
             }
 
@@ -215,7 +260,7 @@ struct SettingsView: View {
                     value: $environment.colimaMemoryGB,
                     in: 2...environment.maxColimaMemoryGB
                 )
-                .disabled(model.isBusy)
+                .disabled(model.isBusy || model.isActionPending)
                 Spacer()
             }
 
@@ -224,11 +269,11 @@ struct SettingsView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            Button("休眠 Colima 以应用设置") {
-                Task { await model.suspendRuntime() }
+            Button("重启 Colima") {
+                Task { await model.restartColimaNow() }
             }
             .controlSize(.small)
-            .disabled(model.isBusy || environment.colimaState != .running)
+            .disabled(model.isBusy || model.isActionPending || environment.tools.colima == nil)
         }
     }
 
@@ -237,13 +282,25 @@ struct SettingsView: View {
     private var performancePanel: some View {
         panel(
             "图形性能",
-            subtitle: "Colima/Lima 不向 Linux 直通 Apple GPU；以下是可调项与限制说明。"
+            subtitle: "应用缩放只能调整控件大小；Retina 清晰度受 XQuartz 输出像素尺寸限制。Colima/Lima 不向 Linux 直通 Apple GPU。"
         ) {
+            Picker("Linux 应用缩放", selection: $environment.displayScale) {
+                Text("原始 1×").tag(1)
+                Text("放大 2×").tag(2)
+            }
+            .pickerStyle(.segmented)
+            .disabled(model.isBusy || model.isActionPending)
+
+            Text("仅调整新启动应用的控件尺寸，不会提高 XQuartz 输出分辨率，也无法修复 Retina 屏上的模糊。已封装的 .app 需重新封装、运行中的应用需重启才会应用此设置。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
             Toggle(
                 "Electron 应用尝试 GPU 合成（实验性）",
                 isOn: $environment.electronGPUEnabled
             )
-            .disabled(model.isBusy)
+            .disabled(model.isBusy || model.isActionPending)
 
             Text("默认追加 --disable-gpu 更稳定。开启后会改为 --ignore-gpu-blocklist / --enable-gpu-rasterization；已封装的应用需要重新封装才会生效，在软件渲染环境下可能更慢或崩溃。")
                 .font(.caption)
@@ -254,7 +311,7 @@ struct SettingsView: View {
                 "XQuartz 启用间接 GLX（enable_iglx）",
                 isOn: $environment.xquartzIGLXEnabled
             )
-            .disabled(model.isBusy)
+            .disabled(model.isBusy || model.isActionPending)
 
             HStack(spacing: 10) {
                 Text("仅对 OpenGL 应用有意义；修改后需重启 XQuartz。")
@@ -265,7 +322,7 @@ struct SettingsView: View {
                     Task { await model.restartXQuartzNow() }
                 }
                 .controlSize(.small)
-                .disabled(model.isBusy || environment.tools.xquartzApp == nil)
+                .disabled(model.isBusy || model.isActionPending || environment.tools.xquartzApp == nil)
             }
 
             Text("真正的 GPU 硬件加速需要 GPU 直通，当前 Colima/Lima 架构不支持。VS Code 建议使用 macOS 原生版 + Remote-Containers/SSH，可获得原生渲染性能。")
@@ -285,7 +342,7 @@ struct SettingsView: View {
                     text: $environment.dockerRegistryMirror
                 )
                 .textFieldStyle(.roundedBorder)
-                .disabled(model.isBusy)
+                .disabled(model.isBusy || model.isActionPending)
 
                 Menu("示例") {
                     Button("官方 Docker Hub") { environment.dockerRegistryMirror = "" }
@@ -295,7 +352,7 @@ struct SettingsView: View {
                 }
                 .menuStyle(.borderlessButton)
                 .frame(width: 64)
-                .disabled(model.isBusy)
+                .disabled(model.isBusy || model.isActionPending)
             }
 
             HStack(spacing: 8) {
@@ -321,6 +378,34 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - VS Code download CDN
+
+    private var vsCodeCDNPanel: some View {
+        panel("VS Code 下载 CDN", subtitle: "可选：为 Ubuntu / Debian 的 VS Code .deb 指定 HTTPS 下载源。") {
+            TextField(
+                "https://example.com/latest/linux-deb-{arch}/stable",
+                text: $model.vsCodeDownloadTemplate
+            )
+            .textFieldStyle(.roundedBorder)
+            .disabled(model.isBusy || model.isActionPending)
+
+            if !model.vsCodeDownloadTemplate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if VSCodeDownloadSource.url(template: model.vsCodeDownloadTemplate, architecture: .x86_64) == nil {
+                    Label("请输入包含 {arch} 的完整 HTTPS 地址。", systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                        .font(.caption)
+                }
+                Button("清空，使用官方源") { model.vsCodeDownloadTemplate = "" }
+                    .controlSize(.small)
+                    .disabled(model.isBusy || model.isActionPending)
+            }
+            Text("{arch} 自动替换为 x64 或 arm64。下载失败时会回退微软官方地址；自定义 CDN 可能收到软件包下载请求，请只使用可信服务。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
     // MARK: - Package manager
 
     private var packageManagerPanel: some View {
@@ -332,6 +417,7 @@ struct SettingsView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
+            .disabled(model.isBusy || model.isActionPending)
 
             Text(environment.packageManagerPreference.detail)
                 .font(.caption)
@@ -352,10 +438,10 @@ struct SettingsView: View {
                         .truncationMode(.middle)
                     Spacer()
                     Button("重新检测") {
-                        Task { await environment.refresh() }
+                        Task { await model.refresh() }
                     }
                     .controlSize(.small)
-                    .disabled(model.isBusy)
+                    .disabled(model.isBusy || model.isActionPending)
                 }
             } else {
                 HStack(spacing: 8) {
@@ -365,18 +451,18 @@ struct SettingsView: View {
                         .font(.callout.weight(.medium))
                     Spacer()
                     if let url = PackageManagerKind.macports.website {
-                        Button("安装 MacPorts") { NSWorkspace.shared.open(url) }
+                        Button("安装 MacPorts") { model.openExternal(url, name: "MacPorts 安装说明") }
                             .controlSize(.small)
                     }
                     if let url = PackageManagerKind.homebrew.website {
-                        Button("安装 Homebrew") { NSWorkspace.shared.open(url) }
+                        Button("安装 Homebrew") { model.openExternal(url, name: "Homebrew 安装说明") }
                             .controlSize(.small)
                     }
                     Button("重新检测") {
-                        Task { await environment.refresh() }
+                        Task { await model.refresh() }
                     }
                     .controlSize(.small)
-                    .disabled(model.isBusy)
+                    .disabled(model.isBusy || model.isActionPending)
                 }
             }
         }
@@ -453,13 +539,13 @@ struct SettingsView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
-                .disabled(model.isBusy)
+                .disabled(model.isBusy || model.isActionPending)
             } else {
                 Button("安装") {
                     Task { await model.installDependency(status.kind) }
                 }
                 .controlSize(.small)
-                .disabled(model.isBusy || environment.resolvedPackageManager == nil)
+                .disabled(model.isBusy || model.isActionPending || environment.resolvedPackageManager == nil)
             }
         }
         .padding(.vertical, 8)
@@ -490,7 +576,7 @@ struct SettingsView: View {
                 Spacer()
                 if let app = environment.tools.xquartzApp {
                     Button("打开 XQuartz") {
-                        NSWorkspace.shared.open(app)
+                        model.openExternal(app, name: "XQuartz")
                     }
                     .controlSize(.small)
                 }
@@ -509,7 +595,7 @@ struct SettingsView: View {
                         Label("从 GitHub 安装 XQuartz", systemImage: "arrow.down.circle")
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(model.isBusy)
+                    .disabled(model.isBusy || model.isActionPending)
 
                     if let url = URL(string: "https://github.com/XQuartz/XQuartz/releases") {
                         Link("打开 GitHub Releases", destination: url)
@@ -529,11 +615,11 @@ struct SettingsView: View {
                         Label("写入配置并启动", systemImage: "wrench.and.screwdriver")
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(model.isBusy)
+                    .disabled(model.isBusy || model.isActionPending)
 
                     Button {
                         if let app = environment.tools.xquartzApp {
-                            NSWorkspace.shared.open(app)
+                            model.openExternal(app, name: "XQuartz")
                         }
                     } label: {
                         Label("打开 XQuartz", systemImage: "arrow.up.forward.app")
@@ -557,7 +643,7 @@ struct SettingsView: View {
                         Task { await model.toggleXQuartzDockIcon() }
                     }
                     .controlSize(.small)
-                    .disabled(model.isBusy)
+                    .disabled(model.isBusy || model.isActionPending)
                 }
             }
         }
@@ -571,6 +657,7 @@ struct SettingsView: View {
                 "所有 Linux 应用退出后自动休眠 Colima",
                 isOn: $environment.autoSuspendEnabled
             )
+            .disabled(model.isBusy || model.isActionPending)
 
             HStack(spacing: 12) {
                 Text("空闲等待")
@@ -580,7 +667,7 @@ struct SettingsView: View {
                     .font(.callout.monospacedDigit())
                     .frame(width: 70, alignment: .leading)
             }
-            .disabled(!environment.autoSuspendEnabled)
+            .disabled(model.isBusy || model.isActionPending || !environment.autoSuspendEnabled)
 
             Text("当前有 \(environment.activeSessionCount) 个由 Graft 启动的 Linux 应用在运行。生成的 .app 使用会话标记文件，因此即使关闭 Graft，空闲检测仍然有效。")
                 .font(.caption)

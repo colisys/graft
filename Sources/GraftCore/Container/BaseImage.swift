@@ -5,6 +5,7 @@ public enum LinuxPackageManager: String, CaseIterable, Identifiable, Sendable {
     case apt
     case pacman
     case apk
+    case dnf
 
     public var id: String { rawValue }
 
@@ -15,6 +16,7 @@ public enum LinuxPackageManager: String, CaseIterable, Identifiable, Sendable {
         case .apt: return "apt-get install"
         case .pacman: return "pacman -S"
         case .apk: return "apk add"
+        case .dnf: return "dnf install"
         }
     }
 }
@@ -29,6 +31,7 @@ public enum BaseImage: String, CaseIterable, Identifiable, Codable, Sendable {
     case debian
     case arch
     case alpine
+    case rocky
 
     public var id: String { rawValue }
 
@@ -38,6 +41,7 @@ public enum BaseImage: String, CaseIterable, Identifiable, Codable, Sendable {
         case .debian: return "Debian 12"
         case .arch: return "Arch Linux"
         case .alpine: return "Alpine Linux"
+                case .rocky: return "Rocky Linux 9（CentOS 下游）"
         }
     }
 
@@ -47,6 +51,7 @@ public enum BaseImage: String, CaseIterable, Identifiable, Codable, Sendable {
         case .debian: return "Debian"
         case .arch: return "Arch"
         case .alpine: return "Alpine"
+                case .rocky: return "Rocky"
         }
     }
 
@@ -56,6 +61,7 @@ public enum BaseImage: String, CaseIterable, Identifiable, Codable, Sendable {
         case .debian: return "12"
         case .arch: return "rolling"
         case .alpine: return "3.20"
+                case .rocky: return "9"
         }
     }
 
@@ -69,6 +75,8 @@ public enum BaseImage: String, CaseIterable, Identifiable, Codable, Sendable {
             return "轻量滚动发行版，使用 pacman；适合愿意自行处理依赖的用户。"
         case .alpine:
             return "体积最小，使用 musl libc；官方 Electron 与 .deb 应用兼容性有限。"
+                    case .rocky:
+                        return "企业 Linux 9 兼容环境，使用 DNF 管理 RPM 软件包。"
         }
     }
 
@@ -78,6 +86,8 @@ public enum BaseImage: String, CaseIterable, Identifiable, Codable, Sendable {
             return "Alpine 使用 musl libc。VS Code 等官方 glibc / Electron 应用可能无法运行；请优先使用 Alpine 原生包。"
         case .arch:
             return "Arch 使用 pacman，不支持官方 .deb；预设应用会改用 Arch 官方包。"
+        case .rocky:
+            return "Rocky 使用 RPM 而非 .deb；请使用 Rocky 9 软件源中的原生包。"
         default:
             return nil
         }
@@ -88,6 +98,7 @@ public enum BaseImage: String, CaseIterable, Identifiable, Codable, Sendable {
         case .ubuntu, .debian: return .apt
         case .arch: return .pacman
         case .alpine: return .apk
+                case .rocky: return .dnf
         }
     }
 
@@ -107,6 +118,7 @@ public enum BaseImage: String, CaseIterable, Identifiable, Codable, Sendable {
         case .debian: return "debian:12-slim"
         case .arch: return "archlinux:latest"
         case .alpine: return "alpine:3.20"
+                case .rocky: return "rockylinux/rockylinux:9"
         }
     }
 
@@ -129,6 +141,7 @@ public enum BaseImage: String, CaseIterable, Identifiable, Codable, Sendable {
         case .debian: return "graft/debian-desktop:12"
         case .arch: return "graft/arch-desktop:latest"
         case .alpine: return "graft/alpine-desktop:3.20"
+                case .rocky: return "graft/rocky-desktop:9"
         }
     }
 
@@ -138,6 +151,7 @@ public enum BaseImage: String, CaseIterable, Identifiable, Codable, Sendable {
         case .debian: return "graft-runtime-debian"
         case .arch: return "graft-runtime-arch"
         case .alpine: return "graft-runtime-alpine"
+                case .rocky: return "graft-runtime-rocky"
         }
     }
 
@@ -147,6 +161,7 @@ public enum BaseImage: String, CaseIterable, Identifiable, Codable, Sendable {
         case .debian: return "graft-home-debian"
         case .arch: return "graft-home-arch"
         case .alpine: return "graft-home-alpine"
+                case .rocky: return "graft-home-rocky"
         }
     }
 
@@ -167,6 +182,8 @@ public enum BaseImage: String, CaseIterable, Identifiable, Codable, Sendable {
             return "例如：firefox、gimp、code"
         case .alpine:
             return "例如：firefox、gimp、vlc"
+                    case .rocky:
+                        return "例如：firefox、thunderbird"
         }
     }
 
@@ -182,6 +199,11 @@ public enum BaseImage: String, CaseIterable, Identifiable, Codable, Sendable {
             return [
                 "base-devel", "git", "cmake", "meson", "ninja",
                 "pkgconf", "autoconf", "automake", "libtool"
+            ]
+        case .rocky:
+            return [
+                "gcc", "gcc-c++", "make", "git", "cmake", "meson", "ninja-build",
+                "pkgconf-pkg-config", "autoconf", "automake", "libtool"
             ]
         case .alpine:
             return [
@@ -233,9 +255,11 @@ public final class RuntimeSettings: @unchecked Sendable {
 
     private let lock = NSLock()
     private var storage: BaseImage = .ubuntu
+    private var environmentNameStorage: String = ""
     private var mirrorStorage: String = ""
     private var electronGPUStorage = false
     private var xquartzIGLXStorage = false
+    private var displayScaleStorage = 1
 
     public init() {}
 
@@ -250,6 +274,12 @@ public final class RuntimeSettings: @unchecked Sendable {
             storage = newValue
             lock.unlock()
         }
+    }
+
+    /// Empty selects the legacy default container; named environments have their own home volume.
+    public var environmentName: String {
+        get { lock.lock(); defer { lock.unlock() }; return environmentNameStorage }
+        set { lock.lock(); environmentNameStorage = newValue; lock.unlock() }
     }
 
     /// Optional Docker registry prefix used when pulling the base image.
@@ -279,6 +309,12 @@ public final class RuntimeSettings: @unchecked Sendable {
             electronGPUStorage = newValue
             lock.unlock()
         }
+    }
+
+    /// Application-side logical scale. Existing processes and wrappers are unaffected.
+    public var displayScale: Int {
+        get { lock.lock(); defer { lock.unlock() }; return displayScaleStorage }
+        set { lock.lock(); displayScaleStorage = newValue == 2 ? 2 : 1; lock.unlock() }
     }
 
     /// XQuartz `enable_iglx` (indirect GLX), only useful for OpenGL apps.

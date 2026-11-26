@@ -73,7 +73,9 @@ public final class AppWrapperGenerator {
             withIntermediateDirectories: true
         )
 
-        let bundleName = sanitizeBundleName(entry.name, fallback: entry.executableToken)
+        let appName = sanitizeBundleName(entry.name, fallback: entry.executableToken)
+        let bundleName = configuration.containerName == configuration.baseImage.containerName
+            ? appName : "\(appName) [\(configuration.containerName)]"
         let bundleURL = Self.wrappersDirectory
             .appendingPathComponent(bundleName, isDirectory: true)
             .appendingPathExtension("app")

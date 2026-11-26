@@ -10,11 +10,13 @@ import AppKit
 public final class EnvironmentManager: ObservableObject {
     public static let packageManagerDefaultsKey = "graft.packageManager"
     public static let baseImageDefaultsKey = "graft.baseImage"
+    public static let environmentNameDefaultsKey = "graft.environmentName"
     public static let dockerRegistryDefaultsKey = "graft.dockerRegistryMirror"
     public static let colimaCPUDefaultsKey = "graft.colimaCPU"
     public static let colimaMemoryDefaultsKey = "graft.colimaMemoryGB"
     public static let electronGPUDefaultsKey = "graft.electronGPU"
     public static let xquartzIGLXDefaultsKey = "graft.xquartzIGLX"
+    public static let displayScaleDefaultsKey = "graft.displayScale"
 
     public nonisolated let log: LogStore
     private let runner: ProcessRunner
@@ -39,6 +41,7 @@ public final class EnvironmentManager: ObservableObject {
             guard baseImage != oldValue else { return }
             UserDefaults.standard.set(baseImage.rawValue, forKey: Self.baseImageDefaultsKey)
             runtimeSettings.baseImage = baseImage
+            environmentName = ""
             log.append(
                 "基础镜像已切换为 \(baseImage.displayName)（\(baseImage.packageManager.displayName)）",
                 level: .info
@@ -50,6 +53,14 @@ public final class EnvironmentManager: ObservableObject {
                 await self.refreshContainerState()
                 await self.refreshStats()
             }
+        }
+    }
+
+    @Published public var environmentName: String {
+        didSet {
+            guard environmentName != oldValue else { return }
+            UserDefaults.standard.set(environmentName, forKey: Self.environmentNameDefaultsKey)
+            runtimeSettings.environmentName = environmentName
         }
     }
 
@@ -72,6 +83,10 @@ public final class EnvironmentManager: ObservableObject {
             UserDefaults.standard.set(dockerRegistryMirror, forKey: Self.dockerRegistryDefaultsKey)
             runtimeSettings.registryMirror = dockerRegistryMirror
         }
+    }
+
+    public var currentContainerName: String {
+        environmentName.isEmpty ? baseImage.containerName : "\(baseImage.containerName)-\(environmentName)"
     }
 
     /// The actual base image reference shown in the UI, including any mirror.
@@ -106,6 +121,14 @@ public final class EnvironmentManager: ObservableObject {
         didSet {
             UserDefaults.standard.set(xquartzIGLXEnabled, forKey: Self.xquartzIGLXDefaultsKey)
             runtimeSettings.xquartzIGLXEnabled = xquartzIGLXEnabled
+        }
+    }
+
+    /// Logical scale of newly started Linux application windows (not XQuartz server DPI).
+    @Published public var displayScale: Int {
+        didSet {
+            UserDefaults.standard.set(displayScale, forKey: Self.displayScaleDefaultsKey)
+            runtimeSettings.displayScale = displayScale
         }
     }
 
@@ -160,6 +183,9 @@ public final class EnvironmentManager: ObservableObject {
         let base = BaseImage(rawValue: storedBase ?? "") ?? .ubuntu
         self.baseImage = base
         runtimeSettings.baseImage = base
+        let savedEnvironment = UserDefaults.standard.string(forKey: Self.environmentNameDefaultsKey) ?? ""
+        self.environmentName = savedEnvironment
+        runtimeSettings.environmentName = savedEnvironment
 
         let storedManager = UserDefaults.standard.string(forKey: Self.packageManagerDefaultsKey)
         self.packageManagerPreference = PackageManagerKind(rawValue: storedManager ?? "") ?? .automatic
@@ -187,6 +213,10 @@ public final class EnvironmentManager: ObservableObject {
         let iglx = UserDefaults.standard.bool(forKey: Self.xquartzIGLXDefaultsKey)
         self.xquartzIGLXEnabled = iglx
         runtimeSettings.xquartzIGLXEnabled = iglx
+
+        let scale = UserDefaults.standard.integer(forKey: Self.displayScaleDefaultsKey) == 2 ? 2 : 1
+        self.displayScale = scale
+        runtimeSettings.displayScale = scale
 
         SessionRegistry.prepare()
         let located = Self.locateTools()
@@ -272,6 +302,7 @@ public final class EnvironmentManager: ObservableObject {
         tools = located
         toolbox.tools = located
         runtimeSettings.baseImage = baseImage
+        runtimeSettings.environmentName = environmentName
         xquartzRunning = await isXQuartzRunning()
         await refreshXQuartzDockIconHidden()
         await refreshColimaState()
@@ -314,7 +345,7 @@ public final class EnvironmentManager: ObservableObject {
         do {
             let result = try await runner.run(
                 docker,
-                ["inspect", "-f", "{{.State.Running}}", baseImage.containerName],
+                ["inspect", "-f", "{{.State.Running}}", currentContainerName],
                 options: RunOptions(timeout: 15)
             )
             if result.succeeded {
@@ -337,7 +368,7 @@ public final class EnvironmentManager: ObservableObject {
         }
         guard let result = try? await runner.run(
             docker,
-            ["stats", "--no-stream", "--format", "{{.CPUPerc}}\t{{.MemUsage}}", baseImage.containerName],
+            ["stats", "--no-stream", "--format", "{{.CPUPerc}}\t{{.MemUsage}}", currentContainerName],
             options: RunOptions(timeout: 15)
         ), result.succeeded else {
             stats = RuntimeStats()
@@ -584,6 +615,8 @@ public final class EnvironmentManager: ObservableObject {
 
         try await waitForXServer(xhost: xhost, timeout: 30)
 
+        // A connection from the container arrives as 127.0.0.1 through Colima's
+        // user-mode networking, so a single allow rule is enough.
         let allowResult = try? await runner.run(
             xhost,
             ["+", "127.0.0.1"],
@@ -821,6 +854,68 @@ public final class EnvironmentManager: ObservableObject {
             level: .success
         )
         noteActivity()
+    }
+
+    /// Restarts Colima so the saved CPU and memory settings take effect.
+    /// Unlike idle shutdown, an explicit restart must report stop failures.
+    public func restartColima() async throws {
+        guard let colima = tools.colima else {
+            throw GraftError.missingDependency(.colima)
+        }
+        let status = try await runner.run(colima, ["status"], options: RunOptions(timeout: 15))
+        if status.succeeded {
+            activityMessage = "正在停止 Colima…"
+            log.append("正在重启 Colima：先停止虚拟机", level: .info)
+            defer { activityMessage = nil }
+            let logStore = log
+            let stopped = try await runner.run(
+                colima,
+                ["stop"],
+                options: RunOptions(timeout: 240),
+                onLine: { line in logStore.append(line) }
+            )
+            guard stopped.succeeded else {
+                await refreshColimaState()
+                throw GraftError.commandFailed("Colima 停止失败：\n\(stopped.combinedOutput.suffix(1200))")
+            }
+        }
+        colimaState = .stopped
+        containerState = .stopped
+        stats = RuntimeStats()
+        idleSince = nil
+        try await ensureColimaRunning()
+    }
+
+    public func stopColimaChecked(reason: String = "手动") async throws {
+        guard let colima = tools.colima else {
+            throw GraftError.missingDependency(.colima)
+        }
+        activityMessage = "正在停止 Colima…"
+        defer { activityMessage = nil }
+
+        log.append("正在停止 Colima（\(reason)）", level: .info)
+        let logStore = log
+        let stopped: ProcessResult
+        do {
+            stopped = try await runner.run(
+                colima,
+                ["stop"],
+                options: RunOptions(timeout: 240),
+                onLine: { line in logStore.append(line) }
+            )
+        } catch {
+            await refreshColimaState()
+            throw GraftError.commandFailed("Colima 停止失败：\n\(error.localizedDescription)")
+        }
+        guard stopped.succeeded else {
+            await refreshColimaState()
+            throw GraftError.commandFailed("Colima 停止失败：\n\(stopped.combinedOutput.suffix(1200))")
+        }
+        colimaState = .stopped
+        containerState = .stopped
+        stats = RuntimeStats()
+        idleSince = nil
+        log.append("Colima 已停止", level: .success)
     }
 
     public func stopColima(reason: String = "手动") async {

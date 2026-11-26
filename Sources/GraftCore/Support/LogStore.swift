@@ -38,7 +38,15 @@ public final class LogStore: ObservableObject, @unchecked Sendable {
     }
 
     private let maxEntries: Int
-    private let fileQueue = DispatchQueue(label: "app.graft.logfile")
+    private let fileQueue: DispatchQueue
+    private let fileURL: URL
+
+    // Pending UI ring. Once full, nextSlot points at the oldest entry.
+    private let pendingLock = NSLock()
+    private var pending: [Entry] = []
+    private var nextSlot = 0
+    private var needsClear = false
+    private var flushScheduled = false
     private let recordingLock = NSLock()
     private var recordingStorage = true
 
@@ -46,8 +54,14 @@ public final class LogStore: ObservableObject, @unchecked Sendable {
         SessionRegistry.logsDirectory.appendingPathComponent("graft.log")
     }
 
-    public init(maxEntries: Int = 3000) {
+    public convenience init(maxEntries: Int = 3000) {
+        self.init(maxEntries: maxEntries, fileURL: Self.logFileURL)
+    }
+
+    init(maxEntries: Int, fileURL: URL, fileQueue: DispatchQueue = DispatchQueue(label: "app.graft.logfile")) {
         self.maxEntries = max(100, maxEntries)
+        self.fileURL = fileURL
+        self.fileQueue = fileQueue
     }
 
     public func append(_ text: String, level: Level = .info) {
@@ -59,16 +73,45 @@ public final class LogStore: ObservableObject, @unchecked Sendable {
             .filter { !$0.isEmpty }
         guard !lines.isEmpty else { return }
 
+        pendingLock.lock()
+        defer { pendingLock.unlock() }
         writeToDisk(lines, level: level)
-
-        DispatchQueue.main.async {
-            for line in lines {
-                self.entries.append(Entry(level: level, text: line))
-            }
-            if self.entries.count > self.maxEntries {
-                self.entries.removeFirst(self.entries.count - self.maxEntries)
+        for line in lines.suffix(maxEntries) {
+            let entry = Entry(level: level, text: line)
+            if pending.count < maxEntries {
+                pending.append(entry)
+            } else {
+                pending[nextSlot] = entry
+                nextSlot = (nextSlot + 1) % maxEntries
             }
         }
+        scheduleFlushLocked()
+    }
+
+    private func scheduleFlushLocked() {
+        guard !flushScheduled else { return }
+        flushScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(16)) {
+            self.flush()
+        }
+    }
+
+    private func flush() {
+        pendingLock.lock()
+        let batch = pending
+        let start = nextSlot
+        let clear = needsClear
+        pending = []
+        nextSlot = 0
+        needsClear = false
+        flushScheduled = false
+        pendingLock.unlock()
+
+        // Publish outside the lock: Combine subscribers can call back into the store.
+        var updated = clear ? [] : Array(entries.suffix(maxEntries - batch.count))
+        updated.append(contentsOf: batch[start...])
+        updated.append(contentsOf: batch[..<start])
+        entries = updated
     }
 
     private var shouldRecord: Bool {
@@ -78,10 +121,9 @@ public final class LogStore: ObservableObject, @unchecked Sendable {
     }
 
     /// Persistent log used to diagnose failed builds / VM shutdowns. File
-    /// logging continues even when the UI log is paused.
+    /// logging retains recorded lines even if the UI ring overflows or is cleared.
     private func writeToDisk(_ lines: [String], level: Level) {
-        fileQueue.async {
-            let url = Self.logFileURL
+        fileQueue.async { [url = fileURL] in
             let fileManager = FileManager.default
             try? fileManager.createDirectory(
                 at: url.deletingLastPathComponent(),
@@ -118,9 +160,12 @@ public final class LogStore: ObservableObject, @unchecked Sendable {
     }
 
     public func clear() {
-        DispatchQueue.main.async {
-            self.entries.removeAll()
-        }
+        pendingLock.lock()
+        defer { pendingLock.unlock() }
+        pending = []
+        nextSlot = 0
+        needsClear = true
+        scheduleFlushLocked()
     }
 
     public func exportText() -> String {

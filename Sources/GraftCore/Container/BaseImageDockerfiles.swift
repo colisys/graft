@@ -14,6 +14,7 @@ RUN apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquir
     && apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=2 -o Acquire::ForceIPv4=true install -y --no-install-recommends \\
         ca-certificates curl wget gnupg xz-utils unzip tzdata \\
         locales fonts-noto-cjk fonts-noto-color-emoji \\
+        adwaita-icon-theme hicolor-icon-theme librsvg2-common \\
         dbus dbus-x11 procps sudo bash passwd \\
         libx11-xcb1 libxcb-dri3-0 libxcb-xkb1 libxkbcommon-x11-0 \\
         libgbm1 libasound2 libnss3 libnspr4 libgtk-3-0 libgtk-4-1 \\
@@ -51,6 +52,7 @@ ENV LANG=zh_CN.UTF-8 \\
 RUN pacman -Syu --noconfirm --needed \\
         ca-certificates curl wget gnupg xz unzip tzdata \\
         noto-fonts-cjk noto-fonts-emoji \\
+        adwaita-icon-theme hicolor-icon-theme librsvg \\
         dbus procps-ng sudo bash shadow \\
         libx11 libxcb libxkbcommon libxkbcommon-x11 mesa alsa-lib nss nspr \\
         gtk3 gtk4 libxss libxtst at-spi2-core libcups libdrm \\
@@ -88,6 +90,7 @@ RUN . /etc/os-release \\
     && apk add --no-cache \\
         bash ca-certificates curl wget gnupg xz unzip tzdata \\
         font-noto-cjk font-noto-emoji \\
+        adwaita-icon-theme hicolor-icon-theme librsvg \\
         dbus procps-ng sudo \\
         libx11 libxcb libxkbcommon libxkbcommon-x11 \\
         mesa mesa-gbm mesa-egl mesa-gl alsa-lib nss \\
@@ -113,12 +116,44 @@ WORKDIR /home/graft
 CMD ["sleep", "infinity"]
 """
 
+    static let rockyLinux = """
+FROM rockylinux/rockylinux:9
+
+RUN dnf install -y --setopt=install_weak_deps=False \\
+        ca-certificates wget xz unzip tzdata glibc-langpack-zh \\
+        google-noto-sans-cjk-ttc-fonts dbus-daemon procps-ng sudo shadow-utils \\
+        adwaita-icon-theme hicolor-icon-theme librsvg2 \\
+        gtk3 libX11-xcb libXScrnSaver libXtst mesa-libgbm mesa-libGL \\
+        alsa-lib nss libsecret libnotify xdg-utils \\
+        dnf-plugins-core \\
+    && dnf config-manager --set-enabled crb \\
+    && dnf clean all \\
+    && rm -rf /var/cache/dnf
+
+ARG USER_UID=501
+RUN useradd -m -U -u ${USER_UID} -s /bin/bash graft \\
+    && echo 'graft ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/graft \\
+    && chmod 0440 /etc/sudoers.d/graft \\
+    && install -d -m 700 -o graft -g graft /tmp/runtime-graft
+
+USER graft
+ENV HOME=/home/graft \\
+    XDG_RUNTIME_DIR=/tmp/runtime-graft \\
+    LANG=zh_CN.UTF-8 \\
+    LC_ALL=zh_CN.UTF-8 \\
+    TZ=Asia/Shanghai
+WORKDIR /home/graft
+
+CMD ["sleep", "infinity"]
+"""
+
     static func template(for baseImage: BaseImage) -> String {
         switch baseImage {
         case .ubuntu: return ubuntuDesktop
         case .debian: return debianDesktop
         case .arch: return archLinux
         case .alpine: return alpineLinux
+                case .rocky: return rockyLinux
         }
     }
 

@@ -23,11 +23,12 @@ struct LogsView: View {
                     .foregroundStyle(.secondary)
 
                 Button {
-                    log.clear()
+                    model.clearLogs()
                 } label: {
                     Label("清空", systemImage: "trash")
                 }
                 .controlSize(.small)
+                .disabled(log.entries.isEmpty || model.isBusy || model.isActionPending)
 
                 Button {
                     model.exportLogs()
@@ -35,6 +36,7 @@ struct LogsView: View {
                     Label("导出", systemImage: "square.and.arrow.up")
                 }
                 .controlSize(.small)
+                .disabled(model.isBusy || model.isActionPending)
             }
             .padding(12)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))

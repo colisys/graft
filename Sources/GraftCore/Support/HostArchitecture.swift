@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 /// The CPU architecture of the macOS host.
 ///
@@ -17,6 +18,12 @@ public enum HostArchitecture: String, Sendable, CaseIterable {
         #if arch(arm64)
         return .arm64
         #else
+        // Rosetta translates Graft, not the physical host that will run Linux.
+        var translated: Int32 = 0
+        var size = MemoryLayout.size(ofValue: translated)
+        if sysctlbyname("sysctl.proc_translated", &translated, &size, nil, 0) == 0, translated == 1 {
+            return .arm64
+        }
         return .x86_64
         #endif
     }

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 import GraftCore
 
 enum ManagementTab: String, CaseIterable, Identifiable {
@@ -28,7 +29,7 @@ enum ManagementTab: String, CaseIterable, Identifiable {
         case .store: return "一键安装常用 Linux 桌面软件，并自动生成 macOS 快捷方式。"
         case .containerApps: return "扫描容器内的 .desktop 条目，按需封装或直接启动。"
         case .wrapped: return "管理已经生成的 .app 快捷方式。"
-        case .custom: return "安装 apt/pacman/apk 软件包，或在容器内从源码编译。"
+        case .custom: return "安装 apt/pacman/apk/dnf 软件包、本地安装包，或在容器内从源码编译。"
         case .logs: return "实时查看外部命令的标准输出与错误。"
         case .settings: return "基础镜像、Docker 镜像源、依赖、XQuartz、节能与运行参数。"
         }
@@ -75,8 +76,23 @@ struct ManagementView: View {
             .background(Color(nsColor: .windowBackgroundColor))
         }
         .frame(minWidth: 980, minHeight: 640)
-        .task { await model.refresh() }
+        .overlay(alignment: .top) {
+            if let toast = model.toast {
+                Label(toast, systemImage: "info.circle")
+                    .font(.callout)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 9)
+                    .background(.regularMaterial, in: Capsule())
+                    .shadow(radius: 6)
+                    .padding(.top, 12)
+                    .allowsHitTesting(false)
+            }
+        }
+
         .onChange(of: environment.baseImage) { _ in
+            Task { await model.refresh() }
+        }
+        .onChange(of: environment.environmentName) { _ in
             Task { await model.refresh() }
         }
         .alert("出错了", isPresented: $model.showingError) {
@@ -84,6 +100,7 @@ struct ManagementView: View {
                 Button("启动运行环境") {
                     Task { await model.requestStartRuntime() }
                 }
+                .disabled(model.isBusy || model.isActionPending)
             }
             Button("好", role: .cancel) {}
         } message: {
@@ -275,21 +292,21 @@ struct ManagementView: View {
             }
             .buttonStyle(.plain)
             .help("刷新")
-            .disabled(model.isBusy)
+            .disabled(model.isBusy || model.isActionPending)
 
             if environment.colimaState == .running {
                 Button("休眠") {
                     Task { await model.suspendRuntime() }
                 }
                 .controlSize(.small)
-                .disabled(model.isBusy)
+                .disabled(model.isBusy || model.isActionPending)
             } else {
                 Button("启动") {
                     Task { await model.requestStartRuntime() }
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
-                .disabled(model.isBusy)
+                .disabled(model.isBusy || model.isActionPending)
             }
         }
         .padding(.horizontal, 22)
@@ -464,7 +481,7 @@ struct PresetCard: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
-                    .disabled(model.isBusy)
+                    .disabled(model.isBusy || model.isActionPending)
                 }
                 Spacer(minLength: 4)
                 Button("重新安装") {
@@ -472,20 +489,20 @@ struct PresetCard: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .disabled(model.isBusy || !supported)
+                .disabled(model.isBusy || model.isActionPending || !supported)
                 Button("卸载", role: .destructive) {
                     Task { await model.uninstall(preset) }
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .disabled(model.isBusy)
+                .disabled(model.isBusy || model.isActionPending)
             }
         } else {
             Button {
                 Task { await model.install(preset) }
             } label: {
                 HStack(spacing: 6) {
-                    if model.isBusy {
+                    if model.isBusy || model.isActionPending {
                         ProgressView().controlSize(.small)
                     }
                     Text(supported ? "一键安装" : "不支持当前镜像")
@@ -494,7 +511,7 @@ struct PresetCard: View {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.small)
-            .disabled(model.isBusy || !supported)
+            .disabled(model.isBusy || model.isActionPending || !supported)
         }
     }
 }
@@ -541,6 +558,7 @@ struct ContainerAppsView: View {
                             }
                         }
                     )
+                    .disabled(model.isBusy || model.isActionPending)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -578,6 +596,7 @@ struct ContainerAppsView: View {
                 Label("刷新", systemImage: "arrow.clockwise")
             }
             .controlSize(.small)
+            .disabled(model.isBusy || model.isActionPending)
 
             Button {
                 Task { await model.wrapAllEntries() }
@@ -585,7 +604,7 @@ struct ContainerAppsView: View {
                 Label("全部封装", systemImage: "square.and.arrow.down")
             }
             .controlSize(.small)
-            .disabled(model.containerEntries.isEmpty || model.isBusy)
+            .disabled(model.containerEntries.isEmpty || model.isBusy || model.isActionPending)
         }
         .padding(12)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -617,14 +636,14 @@ struct ContainerAppsView: View {
                 Task { await model.launchDesktopEntry(entry) }
             }
             .controlSize(.small)
-            .disabled(model.isBusy)
+            .disabled(model.isBusy || model.isActionPending)
 
             Button("封装 .app") {
                 Task { await model.wrapAndReport(entry) }
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.small)
-            .disabled(model.isBusy)
+            .disabled(model.isBusy || model.isActionPending)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -702,6 +721,7 @@ struct WrappedAppsView: View {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.small)
+            .disabled(model.isBusy || model.isActionPending)
 
             Button("显示") {
                 model.reveal(app)
@@ -714,6 +734,7 @@ struct WrappedAppsView: View {
                 Image(systemName: "trash")
             }
             .buttonStyle(.borderless)
+            .disabled(model.isBusy || model.isActionPending)
             .help("删除生成的 .app")
         }
         .padding(.horizontal, 16)
@@ -749,6 +770,17 @@ struct CustomInstallView: View {
     @EnvironmentObject private var environment: EnvironmentManager
     @AppStorage("graft.customInstallMode") private var mode: CustomInstallMode = .package
     @State private var targetBase: BaseImage = .ubuntu
+    @State private var localPackageError: String?
+    @State private var showingLocalPackageError = false
+
+    private var localPackageExtension: String? {
+        switch targetBase {
+        case .ubuntu, .debian: return "deb"
+        case .alpine: return "apk"
+        case .rocky: return "rpm"
+        case .arch: return nil
+        }
+    }
 
     var body: some View {
         ScrollView {
@@ -782,6 +814,11 @@ struct CustomInstallView: View {
         .onAppear {
             targetBase = environment.baseImage
         }
+        .alert("无法安装软件包", isPresented: $showingLocalPackageError) {
+            Button("好", role: .cancel) {}
+        } message: {
+            Text(localPackageError ?? "请选择支持的软件包文件。")
+        }
     }
 
     private var targetPanel: some View {
@@ -790,7 +827,7 @@ struct CustomInstallView: View {
                 GraftIconBadge(symbol: "shippingbox", size: 28)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("目标容器").font(.callout.weight(.semibold))
-                    Text("\(targetBase.displayName) · \(targetBase.containerName) · \(targetBase.packageManager.displayName)")
+                    Text("\(targetBase.displayName) · \(targetBase.containerName)\(environment.environmentName.isEmpty ? "" : "-\(environment.environmentName)") · \(targetBase.packageManager.displayName)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -819,12 +856,13 @@ struct CustomInstallView: View {
                     TextField(targetBase.packagePlaceholder, text: $model.customPackage)
                         .textFieldStyle(.roundedBorder)
                         .onSubmit {
+                            guard !model.isBusy && !model.isActionPending else { return }
                             Task { await model.installCustomPackage(target: targetBase) }
                         }
                     Button {
                         Task { await model.installCustomPackage(target: targetBase) }
                     } label: {
-                        if model.isBusy {
+                        if model.isBusy || model.isActionPending {
                             ProgressView().controlSize(.small)
                         } else {
                             Text("安装")
@@ -832,19 +870,58 @@ struct CustomInstallView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(
-                        model.isBusy
+                        model.isBusy || model.isActionPending
                             || model.customPackage.trimmingCharacters(in: .whitespaces).isEmpty
                     )
                 }
 
+                Divider()
+
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("本地软件包").font(.callout.weight(.semibold))
+                        Text(localPackageExtension.map { "选择 .\($0) 文件安装到 \(targetBase.displayName)" }
+                             ?? "Arch 暂不支持从本地软件包文件安装。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button {
+                        chooseLocalPackage()
+                    } label: {
+                        Label("选择文件…", systemImage: "folder")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(model.isBusy || model.isActionPending || localPackageExtension == nil)
+                }
+
                 Label(
-                    "安装到：\(targetBase.displayName)（\(targetBase.containerName)）",
+                    "安装到：\(targetBase.displayName)（\(targetBase.containerName)\(environment.environmentName.isEmpty ? "" : "-\(environment.environmentName)")）",
                     systemImage: "shippingbox"
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
             }
         }
+    }
+
+    private func chooseLocalPackage() {
+        guard let ext = localPackageExtension, !model.isBusy, !model.isActionPending else { return }
+        let base = targetBase
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [UTType(filenameExtension: ext) ?? .data]
+        panel.message = "选择要安装到 \(base.displayName) 的 .\(ext) 软件包"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard !model.isBusy && !model.isActionPending else { return }
+        guard url.pathExtension.lowercased() == ext else {
+            localPackageError = "\(base.displayName) 仅支持 .\(ext) 软件包文件。"
+            showingLocalPackageError = true
+            return
+        }
+        Task { await model.installLocalPackage(url, target: base) }
     }
 
     private var sourcePanel: some View {
@@ -889,14 +966,14 @@ struct CustomInstallView: View {
                     Button {
                         Task { await model.installFromSource(target: targetBase) }
                     } label: {
-                        if model.isBusy {
+                        if model.isBusy || model.isActionPending {
                             ProgressView().controlSize(.small)
                         } else {
                             Text("执行")
                         }
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(model.isBusy || !model.sourceCommandIsRunnable)
+                    .disabled(model.isBusy || model.isActionPending || !model.sourceCommandIsRunnable)
                 }
 
                 Label(

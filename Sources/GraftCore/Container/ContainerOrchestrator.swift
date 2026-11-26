@@ -43,23 +43,33 @@ public final class ContainerOrchestrator: @unchecked Sendable {
     private let runtimeSettings: RuntimeSettings
     private let fileManager = FileManager.default
     private let host: HostResources
+    private let vsCodeDownloadTemplate: String
 
     public init(
         log: LogStore,
         toolbox: Toolbox = .shared,
         runner: ProcessRunner = .shared,
         runtimeSettings: RuntimeSettings = .shared,
-        host: HostResources = .current
+        host: HostResources = .current,
+        vsCodeDownloadTemplate: String = ""
     ) {
         self.log = log
         self.toolbox = toolbox
         self.runner = runner
         self.runtimeSettings = runtimeSettings
         self.host = host
+        self.vsCodeDownloadTemplate = vsCodeDownloadTemplate
     }
 
     public var baseImage: BaseImage { runtimeSettings.baseImage }
-    public var containerName: String { baseImage.containerName }
+    public var containerName: String {
+        let name = runtimeSettings.environmentName
+        return name.isEmpty ? baseImage.containerName : "\(baseImage.containerName)-\(name)"
+    }
+    public var homeVolumeName: String {
+        let name = runtimeSettings.environmentName
+        return name.isEmpty ? baseImage.homeVolumeName : "\(baseImage.homeVolumeName)-\(name)"
+    }
     public var imageName: String { baseImage.imageName }
 
     // MARK: - Docker plumbing
@@ -270,7 +280,7 @@ public final class ContainerOrchestrator: @unchecked Sendable {
         let base = baseImage
         var arguments: [String] = [
             "run", "-d",
-            "--name", base.containerName,
+            "--name", containerName,
             "--platform", host.architecture.dockerPlatform,
             "-e", "DISPLAY=\(GraftConstants.display)",
             "-e", "HOME=/home/graft",
@@ -281,7 +291,7 @@ public final class ContainerOrchestrator: @unchecked Sendable {
             arguments.append(contentsOf: ["-e", "\(key)=\(value)"])
         }
         arguments.append(contentsOf: hostMountArguments())
-        arguments.append(contentsOf: ["-v", "\(base.homeVolumeName):/home/graft"])
+        arguments.append(contentsOf: ["-v", "\(homeVolumeName):/home/graft"])
         arguments.append(contentsOf: [base.imageName, "sleep", "infinity"])
         return arguments
     }
@@ -298,6 +308,18 @@ public final class ContainerOrchestrator: @unchecked Sendable {
             }
         }
         return arguments
+    }
+
+    public func createNamedContainer() async throws {
+        try await ensureDockerDaemon()
+        let docker = try requireDocker()
+        let inspect = try await runner.run(docker, ["container", "inspect", containerName], options: RunOptions(timeout: 30))
+        guard !inspect.succeeded else {
+            throw GraftError.installFailed("容器 \(containerName) 已存在，请选择另一个环境名。")
+        }
+        try await ensureImage()
+        _ = try await invokeDocker(containerRunArguments(), timeout: 240)
+        try await waitForContainerRunning()
     }
 
     public func prepare(progress: ProgressHandler? = nil) async throws {
@@ -463,7 +485,10 @@ public final class ContainerOrchestrator: @unchecked Sendable {
                 throw GraftError.installFailed("\(baseImage.displayName) 不使用 .deb 安装包。")
             }
             let url = host.architecture == .arm64 ? arm64URL : amd64URL
-            try await installDeb(from: url, name: preset.id, progress: progress)
+            let mirror = preset.id == "vscode"
+                ? VSCodeDownloadSource.url(template: vsCodeDownloadTemplate, architecture: host.architecture)
+                : nil
+            try await installDeb(from: url, name: preset.id, mirrorURL: mirror, progress: progress)
         case .mozillaRepository(let packages):
             guard baseImage.isDebianBased else {
                 throw GraftError.installFailed("Mozilla APT 源仅适用于 Debian / Ubuntu。")
@@ -477,6 +502,8 @@ public final class ContainerOrchestrator: @unchecked Sendable {
             try await installFirefoxTarball(from: url, progress: progress)
         case .pacman(let packages):
             try await pacmanInstall(packages, progress: progress)
+        case .dnf(let packages):
+            try await dnfInstall(packages, progress: progress)
         case .apk(let packages):
             try await apkInstall(packages, progress: progress)
         }
@@ -493,6 +520,8 @@ public final class ContainerOrchestrator: @unchecked Sendable {
             try await aptInstall(packages, progress: progress)
         case .pacman:
             try await pacmanInstall(packages, progress: progress)
+        case .dnf:
+            try await dnfInstall(packages, progress: progress)
         case .apk:
             try await apkInstall(packages, progress: progress)
         }
@@ -526,6 +555,9 @@ public final class ContainerOrchestrator: @unchecked Sendable {
         case .pacman(let packages):
             let names = packages.map(ShellQuote.quote).joined(separator: " ")
             _ = try? await runAsRoot("pacman -R --noconfirm \(names)", timeout: 600)
+        case .dnf(let packages):
+            let names = packages.map(ShellQuote.quote).joined(separator: " ")
+            _ = try? await runAsRoot("dnf -y --setopt=clean_requirements_on_remove=False remove \(names)", timeout: 600)
         case .apk(let packages):
             let names = packages.map(ShellQuote.quote).joined(separator: " ")
             _ = try? await runAsRoot("apk del \(names)", timeout: 600)
@@ -552,6 +584,13 @@ public final class ContainerOrchestrator: @unchecked Sendable {
         let script = "pacman -Syu --noconfirm --needed \(joined)"
         progress?("pacman -Syu \(packages.joined(separator: " "))")
         try await runAsRoot(script, timeout: 3600)
+    }
+
+    private func dnfInstall(_ packages: [String], progress: ProgressHandler? = nil) async throws {
+        guard !packages.isEmpty else { return }
+        let joined = packages.map(ShellQuote.quote).joined(separator: " ")
+        progress?("dnf install \(packages.joined(separator: " "))")
+        try await runAsRoot("dnf -y install \(joined)", timeout: 2400)
     }
 
     private func apkInstall(_ packages: [String], progress: ProgressHandler? = nil) async throws {
@@ -610,7 +649,40 @@ public final class ContainerOrchestrator: @unchecked Sendable {
         log.append("源码安装命令执行完成", level: .success)
     }
 
-    public func installDeb(from url: String, name: String, progress: ProgressHandler? = nil) async throws {
+    public func installLocalPackage(at url: URL, progress: ProgressHandler? = nil) async throws {
+        let extensionExpected: String
+        let installCommand: String
+        switch baseImage.packageManager {
+        case .apt: extensionExpected = "deb"; installCommand = "apt-get \(Self.aptNetworkOptions) install -y --no-install-recommends"
+        case .apk: extensionExpected = "apk"; installCommand = "apk add --allow-untrusted"
+        case .dnf: extensionExpected = "rpm"; installCommand = "dnf -y install"
+        case .pacman: throw GraftError.installFailed("Arch 不支持 .deb/.apk/.rpm；请使用 pacman 安装软件包。")
+        }
+        guard url.pathExtension.lowercased() == extensionExpected else {
+            throw GraftError.installFailed("\(baseImage.displayName) 仅支持 .\(extensionExpected) 安装包。")
+        }
+        let accessing = url.startAccessingSecurityScopedResource()
+        defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+        guard fileManager.isReadableFile(atPath: url.path) else {
+            throw GraftError.installFailed("无法读取安装包：\(url.lastPathComponent)")
+        }
+        try await prepare(progress: progress)
+        let docker = try requireDocker()
+        let remote = "/tmp/graft-local-\(UUID().uuidString).\(extensionExpected)"
+        progress?("正在复制 \(url.lastPathComponent) 到容器…")
+        let copy = try await runner.run(docker, ["cp", url.path, "\(containerName):\(remote)"], options: RunOptions(timeout: 300))
+        guard copy.succeeded else {
+            throw GraftError.installFailed("复制安装包失败：\(copy.combinedOutput.suffix(800))")
+        }
+        defer {
+            Task { try? await self.runAsRoot("rm -f \(ShellQuote.quote(remote))", timeout: 30) }
+        }
+        progress?("正在安装 \(url.lastPathComponent)…")
+        try await runAsRoot("\(installCommand) \(ShellQuote.quote(remote))", timeout: 2400)
+        log.append("已安装本地安装包：\(url.lastPathComponent)", level: .success)
+    }
+
+    public func installDeb(from url: String, name: String, mirrorURL: String? = nil, progress: ProgressHandler? = nil) async throws {
         guard baseImage.isDebianBased else {
             throw GraftError.installFailed("\(baseImage.displayName) 不使用 .deb 安装包。")
         }
@@ -628,25 +700,38 @@ public final class ContainerOrchestrator: @unchecked Sendable {
         let localURL = tempDirectory.appendingPathComponent(fileName)
         let remoteURL = "/tmp/graft-install-\(UUID().uuidString).deb"
 
-        progress?("正在下载安装包 \(fileName)（可能需要几分钟）…")
-        let logStore = log
-        let download = try await runner.run(
-            curl,
-            [
-                "-fL",
-                "--retry", "3",
-                "--retry-delay", "2",
-                "--connect-timeout", "30",
-                "--max-time", "1800",
-                "--progress-bar",
-                "-o", localURL.path,
-                url
-            ],
-            options: RunOptions(timeout: 3600),
-            onLine: { line in logStore.append(line) }
-        )
-        guard download.succeeded else {
-            throw GraftError.installFailed("下载失败：\n\(download.combinedOutput.suffix(800))")
+        let sources = (mirrorURL.map { [$0] } ?? []) + [url]
+        var failures: [String] = []
+        var downloaded = false
+        for source in sources {
+            progress?("正在从 \(source == url ? "官方源" : "自定义 CDN") 下载 \(fileName)…")
+            let logStore = log
+            log.append("正在下载 \(fileName)：\(source)", level: .info)
+            do {
+                let download = try await runner.run(
+                    curl,
+                    ["-fL", "--retry", "2", "--retry-delay", "2",
+                     "--connect-timeout", "30", "--max-time", "600",
+                     "--silent", "--show-error", "-o", localURL.path, source],
+                    options: RunOptions(timeout: 660),
+                    onLine: { line in logStore.append(line) }
+                )
+                let size = try? localURL.resourceValues(forKeys: [.fileSizeKey]).fileSize
+                if download.succeeded, let size, size > 0 {
+                    downloaded = true
+                    break
+                }
+                failures.append("\(source)：curl 退出码 \(download.exitCode)；\(download.combinedOutput.suffix(400))")
+            } catch {
+                failures.append("\(source)：\(error.localizedDescription)")
+            }
+            try? fileManager.removeItem(at: localURL)
+            if source != url {
+                log.append("自定义 CDN 下载失败，改用微软官方源。", level: .warning)
+            }
+        }
+        guard downloaded else {
+            throw GraftError.installFailed("下载 \(fileName) 失败：\n\(failures.joined(separator: "\n"))")
         }
         log.append("安装包下载完成：\(fileName)", level: .success)
 
@@ -809,6 +894,9 @@ public final class ContainerOrchestrator: @unchecked Sendable {
             tokens = ["env", "MOZ_DISABLE_CONTENT_SANDBOX=1"] + tokens
         }
         if isElectron(entry: entry) {
+            if runtimeSettings.displayScale == 2 && !tokens.contains(where: { $0.hasPrefix("--force-device-scale-factor=") }) {
+                tokens.append("--force-device-scale-factor=2")
+            }
             if !tokens.contains("--no-sandbox") {
                 tokens.append("--no-sandbox")
             }
@@ -822,7 +910,17 @@ public final class ContainerOrchestrator: @unchecked Sendable {
                 tokens.append("--disable-gpu")
             }
         }
-        return ["dbus-run-session", "--"] + tokens
+        let scale = runtimeSettings.displayScale
+        let scaleEnvironment: [String]
+        if scale == 2 {
+            // Chromium uses its own device-scale factor; avoid applying GTK scaling twice.
+            scaleEnvironment = isElectron(entry: entry)
+                ? ["env", "QT_SCALE_FACTOR=2"]
+                : ["env", "GDK_SCALE=2", "QT_SCALE_FACTOR=2"]
+        } else {
+            scaleEnvironment = []
+        }
+        return ["dbus-run-session", "--"] + scaleEnvironment + tokens
     }
 
     private func isFirefox(entry: DesktopEntry) -> Bool {

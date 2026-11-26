@@ -4,10 +4,10 @@ import Foundation
 ///
 /// It is intentionally stored as a Swift string constant so Graft is a single
 /// self-contained binary with no bundled image/tarball. The base image is
-/// pulled from Docker Hub at build time (Ubuntu 24.04 LTS, multi-arch).
+/// pulled at build time from Docker Hub or the selected registry mirror.
 ///
 /// Legal note: this template only *references* third-party packages resolved
-/// by apt at build time. No third-party source or binary is distributed with
+/// by the distribution's package manager at build time. No third-party source or binary is distributed with
 /// Graft itself.
 public enum BuiltinDockerfile {
     public static let ubuntuDesktop = """
@@ -23,6 +23,7 @@ RUN apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquir
     && apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=2 -o Acquire::ForceIPv4=true install -y --no-install-recommends \\
         ca-certificates curl wget gnupg xz-utils unzip \\
         locales fonts-noto-cjk fonts-noto-color-emoji \\
+        adwaita-icon-theme hicolor-icon-theme librsvg2-common \\
         dbus dbus-x11 procps sudo passwd bash \\
         libx11-xcb1 libxcb-dri3-0 libxcb-xkb1 libxkbcommon-x11-0 \\
         libgbm1 libasound2t64 libnss3 libnspr4 libgtk-3-0 libgtk-4-1 \\

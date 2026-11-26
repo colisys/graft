@@ -292,6 +292,22 @@ final class ProcessRunnerTests: XCTestCase {
     }
 }
 
+final class VSCodeDownloadSourceTests: XCTestCase {
+    func testArchitectureSubstitution() {
+        let template = "https://example.com/latest/linux-deb-{arch}/stable"
+        XCTAssertEqual(VSCodeDownloadSource.url(template: template, architecture: .arm64),
+                       "https://example.com/latest/linux-deb-arm64/stable")
+        XCTAssertEqual(VSCodeDownloadSource.url(template: template, architecture: .x86_64),
+                       "https://example.com/latest/linux-deb-x64/stable")
+    }
+
+    func testRejectsUntrustedOrIncompleteTemplates() {
+        XCTAssertNil(VSCodeDownloadSource.url(template: "http://example.com/{arch}", architecture: .arm64))
+        XCTAssertNil(VSCodeDownloadSource.url(template: "https://example.com/latest", architecture: .arm64))
+        XCTAssertNil(VSCodeDownloadSource.url(template: "https://user:pass@example.com/{arch}", architecture: .arm64))
+    }
+}
+
 final class PresetCatalogTests: XCTestCase {
     func testPresetsHaveUniqueIdentifiers() {
         let identifiers = PresetCatalog.all.map(\.id)

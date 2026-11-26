@@ -3,6 +3,7 @@ import AppKit
 import Combine
 import SwiftUI
 import UniformTypeIdentifiers
+import UserNotifications
 import GraftCore
 
 @MainActor
@@ -14,6 +15,7 @@ final class AppModel: ObservableObject {
     let environment: EnvironmentManager
     let orchestrator: ContainerOrchestrator
     let wrapperGenerator: AppWrapperGenerator
+    @AppStorage(VSCodeDownloadSource.defaultsKey) var vsCodeDownloadTemplate = ""
 
     static let defaultSourceCommand = """
     # 在 /home/graft 下从源码构建，并安装到 /usr/local
@@ -35,6 +37,9 @@ final class AppModel: ObservableObject {
     @Published var installBuildTools = true
     @Published private(set) var isBusy = false
     @Published private(set) var busyMessage: String?
+    @Published private(set) var toast: String?
+    private var toastTask: Task<Void, Never>?
+    @Published private(set) var isActionPending = false
     @Published var errorMessage: String?
     @Published var showingError = false
 
@@ -228,12 +233,13 @@ final class AppModel: ObservableObject {
 
     func wrappedApp(for preset: PresetApp, base: BaseImage) -> WrappedApp? {
         if let record = installationRecord(for: preset, base: base),
+           record.containerName == environment.currentContainerName,
            let path = record.bundlePath,
            let app = wrappedApps.first(where: { $0.bundleURL.path == path }) {
             return app
         }
         return wrappedApps.first { app in
-            (app.containerName == nil || app.containerName == base.containerName)
+            (app.containerName == nil || app.containerName == environment.currentContainerName)
                 && matchesPreset(app, preset)
         }
     }
@@ -241,6 +247,7 @@ final class AppModel: ObservableObject {
     func installationRecord(for preset: PresetApp, base: BaseImage) -> InstalledApplication? {
         installations.first {
             $0.presetID == preset.id && $0.baseImage == base
+                && $0.containerName == environment.currentContainerName
         }
     }
 
@@ -262,7 +269,9 @@ final class AppModel: ObservableObject {
     }
 
     func containerInfo(for base: BaseImage) -> DockerContainerInfo? {
-        containers.first { $0.name == base.containerName }
+        let name = environment.environmentName.isEmpty
+            ? base.containerName : "\(base.containerName)-\(environment.environmentName)"
+        return containers.first { $0.name == name }
     }
 
     func containerStatusLabel(for base: BaseImage) -> String {
@@ -275,7 +284,10 @@ final class AppModel: ObservableObject {
     func refresh() async {
         // Do not race an in-flight build/install. Operations refresh the
         // environment themselves when they finish.
-        guard !isBusy else { return }
+        guard !isBusy && !isActionPending else { return }
+        isBusy = true
+        showToast("正在刷新状态…")
+        defer { isBusy = false }
         await environment.refresh()
         wrappedApps = Self.scanWrappedApps()
         backfillInstallations()
@@ -283,8 +295,10 @@ final class AppModel: ObservableObject {
             await reloadContainerEntries()
             await reloadContainers()
         } else {
+            containerEntries = []
             containers = []
         }
+        showToast("状态已刷新")
     }
 
     private func reloadContainers() async {
@@ -343,12 +357,20 @@ final class AppModel: ObservableObject {
     /// time. That pulls and installs third-party packages, so it also goes
     /// through the legal consent gate.
     func requestStartRuntime() async {
+        guard !isBusy && !isActionPending else { return }
+        // Lock the entire start flow, including the Docker image check and consent dialog.
+        isActionPending = true
         // Verify / start Colima before deciding whether an image build (and
         // therefore consent) is required. The cached state may be stale after
         // Colima was stopped externally.
-        guard await ensureRuntimeReady() else { return }
+        guard await ensureRuntimeReady() else {
+            isActionPending = false
+            return
+        }
 
-        if await orchestrator.imageExists() {
+        let imageExists = await orchestrator.imageExists()
+        isActionPending = false
+        if imageExists {
             await startRuntime()
             return
         }
@@ -368,6 +390,7 @@ final class AppModel: ObservableObject {
         guard !isBusy else { return false }
         isBusy = true
         busyMessage = "正在启动 Colima…"
+        showToast("正在启动 Colima…")
         environment.beginOperation()
         defer {
             isBusy = false
@@ -377,6 +400,7 @@ final class AppModel: ObservableObject {
         do {
             try await environment.ensureColimaRunning()
             try await orchestrator.ensureDockerDaemon()
+            showToast("Colima 已启动")
             return true
         } catch {
             present(error)
@@ -395,8 +419,27 @@ final class AppModel: ObservableObject {
     }
 
     func suspendRuntime() async {
-        guard !isBusy else { return }
-        await environment.stopColima(reason: "用户请求休眠")
+        await perform("正在停止 Colima…") {
+            try await self.environment.stopColimaChecked(reason: "用户请求休眠")
+            await self.environment.refresh()
+            self.containerEntries = []
+            self.containers = []
+        }
+    }
+
+    func restartColimaNow() async {
+        await perform("正在重启 Colima…") {
+            do {
+                try await self.environment.restartColima()
+                try await self.orchestrator.ensureDockerDaemon()
+            } catch {
+                await self.environment.refresh()
+                await self.reloadContainers()
+                throw error
+            }
+            await self.environment.refresh()
+            await self.reloadContainers()
+        }
     }
 
     func configureXQuartzNow() async {
@@ -412,6 +455,7 @@ final class AppModel: ObservableObject {
     }
 
     func toggleXQuartzDockIcon() async {
+        guard !isBusy && !isActionPending else { return }
         let hidden = environment.xquartzDockIconHidden
         let alert = NSAlert()
         alert.messageText = hidden ? "恢复 XQuartz Dock 图标？" : "隐藏 XQuartz Dock 图标？"
@@ -422,7 +466,10 @@ final class AppModel: ObservableObject {
         alert.addButton(withTitle: "继续")
         alert.addButton(withTitle: "取消")
         NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        isActionPending = true
+        let accepted = alert.runModal() == .alertFirstButtonReturn
+        isActionPending = false
+        guard accepted else { return }
 
         await perform(hidden ? "正在恢复 XQuartz…" : "正在隐藏 XQuartz…") {
             try await self.environment.setXQuartzDockIconHidden(!hidden)
@@ -458,14 +505,17 @@ final class AppModel: ObservableObject {
     private func orchestrator(for base: BaseImage) -> ContainerOrchestrator {
         let settings = RuntimeSettings()
         settings.baseImage = base
+        settings.environmentName = environment.environmentName
         settings.registryMirror = environment.dockerRegistryMirror
         settings.electronGPUEnabled = environment.electronGPUEnabled
         settings.xquartzIGLXEnabled = environment.xquartzIGLXEnabled
+        settings.displayScale = environment.displayScale
         return ContainerOrchestrator(
             log: log,
             toolbox: .shared,
             runner: .shared,
-            runtimeSettings: settings
+            runtimeSettings: settings,
+            vsCodeDownloadTemplate: vsCodeDownloadTemplate
         )
     }
 
@@ -481,27 +531,94 @@ final class AppModel: ObservableObject {
 
     private func performInstall(_ preset: PresetApp, base: BaseImage) async {
         await perform("正在安装 \(preset.name)…") {
-            let progress = self.progressHandler()
-            let target = self.orchestrator(for: base)
-            try await self.environment.configureXQuartz()
-            try await self.environment.ensureColimaRunning()
-            try await target.install(preset, progress: progress)
-            let entries = try await target.listDesktopEntries()
-            if base == self.environment.baseImage {
-                self.containerEntries = entries
+            do {
+                try await self.installPreset(preset, base: base)
+            } catch {
+                await self.refreshAfterInstall(base: base)
+                throw error
             }
-            try await self.wrapEntries(
-                entries,
-                matching: preset.desktopHints,
-                label: preset.name,
-                presetID: preset.id,
-                base: base,
-                using: target
-            )
-            await self.environment.refresh()
-            self.wrappedApps = Self.scanWrappedApps()
-            self.installations = InstallationRegistry.shared.all()
-            await self.reloadContainers()
+            await self.refreshAfterInstall(base: base)
+        }
+    }
+
+    private func installPreset(_ preset: PresetApp, base: BaseImage) async throws {
+        let progress = progressHandler()
+        let target = orchestrator(for: base)
+        try await environment.configureXQuartz()
+        try await environment.ensureColimaRunning()
+        try await target.install(preset, progress: progress)
+        let entries = try await target.listDesktopEntries()
+        if base == environment.baseImage {
+            containerEntries = entries
+        }
+        try await wrapEntries(
+            entries,
+            matching: preset.desktopHints,
+            label: preset.name,
+            presetID: preset.id,
+            base: base,
+            using: target
+        )
+    }
+
+    private func refreshAfterInstall(base: BaseImage) async {
+        await environment.refresh()
+        wrappedApps = Self.scanWrappedApps()
+        installations = InstallationRegistry.shared.all()
+        if environment.colimaState == .running {
+            await reloadContainers()
+            if base == environment.baseImage {
+                await reloadContainerEntries()
+            }
+        } else {
+            containers = []
+            containerEntries = []
+        }
+    }
+
+    func createEnvironment(named input: String) async {
+        let name = input.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard name.range(of: "^[a-z0-9][a-z0-9-]{0,30}$", options: .regularExpression) != nil else {
+            present(GraftError.installFailed("环境名只能包含小写字母、数字和连字符（最多 31 字符）。"))
+            return
+        }
+        guard !isBusy && !isActionPending else { return }
+        let base = environment.baseImage
+        let settings = RuntimeSettings()
+        settings.baseImage = base
+        settings.environmentName = name
+        settings.registryMirror = environment.dockerRegistryMirror
+        let target = ContainerOrchestrator(log: log, runtimeSettings: settings)
+        guard !containers.contains(where: { $0.name == target.containerName }) else {
+            present(GraftError.installFailed("环境 \(name) 已存在。"))
+            return
+        }
+        requestInstallConsent(software: "\(base.displayName) 环境 \(name)", detail: "从已有基础镜像创建独立容器与 home 数据卷。若镜像尚未构建，Graft 会先拉取并构建。") {
+            await self.perform("正在创建环境 \(name)…") {
+                try await self.environment.ensureColimaRunning()
+                try await target.createNamedContainer()
+                self.environment.environmentName = name
+                await self.environment.refresh()
+                await self.reloadContainers()
+                await self.reloadContainerEntries()
+            }
+        }
+    }
+
+    func installLocalPackage(_ url: URL, target base: BaseImage? = nil) async {
+        let selected = base ?? environment.baseImage
+        requestInstallConsent(software: url.lastPathComponent, detail: "Graft 会把本地安装包复制到 \(selected.displayName) 的当前环境，使用 \(selected.packageManager.displayName) 安装；请只使用可信安装包。") {
+            await self.perform("正在安装 \(url.lastPathComponent)…") {
+                do {
+                    try await self.environment.ensureColimaRunning()
+                    let target = self.orchestrator(for: selected)
+                    try await target.installLocalPackage(at: url, progress: self.progressHandler())
+                } catch {
+                    await self.refreshAfterInstall(base: selected)
+                    throw error
+                }
+                await self.refreshAfterInstall(base: selected)
+            }
         }
     }
 
@@ -597,7 +714,7 @@ final class AppModel: ObservableObject {
         detail: String,
         action: @escaping @MainActor () async -> Void
     ) {
-        guard !isBusy else { return }
+        guard !isBusy && !isActionPending else { return }
 
         // Make sure the user has a visible window context for the consent
         // dialog even when the action was triggered from the menu bar.
@@ -615,8 +732,16 @@ final class AppModel: ObservableObject {
         NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
         NSApp.activate(ignoringOtherApps: true)
 
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        Task { await action() }
+        isActionPending = true
+        let accepted = alert.runModal() == .alertFirstButtonReturn
+        if !accepted {
+            isActionPending = false
+            return
+        }
+        Task {
+            isActionPending = false
+            await action()
+        }
     }
 
     // MARK: - Wrapping
@@ -717,8 +842,11 @@ final class AppModel: ObservableObject {
     // MARK: - Launch / manage wrappers
 
     func launch(_ app: WrappedApp) {
+        showToast("正在启动 \(app.name)…")
         environment.noteActivity()
-        NSWorkspace.shared.open(app.bundleURL)
+        if !NSWorkspace.shared.open(app.bundleURL) {
+            present(GraftError.commandFailed("无法打开 \(app.name).app"))
+        }
     }
 
     func launchDesktopEntry(_ entry: DesktopEntry) async {
@@ -767,16 +895,34 @@ final class AppModel: ObservableObject {
 
     func reveal(_ app: WrappedApp) {
         NSWorkspace.shared.activateFileViewerSelecting([app.bundleURL])
+        showToast("已在访达中显示 \(app.name)")
     }
 
     func remove(_ app: WrappedApp) {
         do {
             try FileManager.default.removeItem(at: app.bundleURL)
             log.append("已删除 \(app.name).app", level: .info)
+            showToast("已删除 \(app.name).app")
         } catch {
             present(error)
         }
         wrappedApps = Self.scanWrappedApps()
+    }
+
+    func openExternal(_ url: URL, name: String) {
+        showToast("正在打开 \(name)…")
+        if !NSWorkspace.shared.open(url) {
+            present(GraftError.commandFailed("无法打开 \(name)"))
+        }
+    }
+
+    func clearLogs() {
+        log.clear()
+        showToast("日志已清空")
+    }
+
+    func notifySettingChanged(_ name: String) {
+        showToast("\(name)已更新")
     }
 
     // MARK: - Logs
@@ -786,8 +932,10 @@ final class AppModel: ObservableObject {
         panel.nameFieldStringValue = "graft-log.txt"
         panel.allowedContentTypes = [.plainText]
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        showToast("正在导出日志…")
         do {
             try log.exportText().write(to: url, atomically: true, encoding: .utf8)
+            showToast("日志已导出")
         } catch {
             present(error)
         }
@@ -806,10 +954,13 @@ final class AppModel: ObservableObject {
     }
 
     private func perform(_ message: String, operation: @escaping @MainActor () async throws -> Void) async {
-        guard !isBusy else { return }
+        guard !isBusy && !isActionPending else { return }
         environment.beginOperation()
         isBusy = true
         busyMessage = message
+        showToast(message)
+        let longRunning = message.contains("安装") || message.contains("构建") || message.contains("创建环境") || message.contains("准备 Linux") || message.contains("执行源码")
+        if longRunning { sendSystemNotification(title: "Graft 开始操作", body: message) }
         defer {
             isBusy = false
             busyMessage = nil
@@ -817,8 +968,12 @@ final class AppModel: ObservableObject {
         }
         do {
             try await operation()
+            let completed = message.replacingOccurrences(of: "正在", with: "").replacingOccurrences(of: "…", with: "") + "完成"
+            showToast(completed)
+            if longRunning { sendSystemNotification(title: "Graft 操作完成", body: completed) }
         } catch {
             present(error)
+            if longRunning { sendSystemNotification(title: "Graft 操作失败", body: "\(message)：\(error.localizedDescription)") }
         }
         environment.noteActivity()
     }
@@ -827,7 +982,30 @@ final class AppModel: ObservableObject {
         let message = error.localizedDescription
         errorMessage = message
         showingError = true
+        showToast("操作失败：\(message)")
         log.append(message, level: .error)
+    }
+
+    private func showToast(_ text: String) {
+        toastTask?.cancel()
+        toast = text
+        toastTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.toast = nil
+        }
+    }
+
+    private func sendSystemNotification(title: String, body: String) {
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            guard granted else { return }
+            let content = UNMutableNotificationContent()
+            content.title = title
+            content.body = body
+            let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+            center.add(request)
+        }
     }
 
     static func scanWrappedApps() -> [WrappedApp] {
@@ -866,7 +1044,9 @@ final class AppModel: ObservableObject {
     // MARK: - Container management
 
     func refreshContainersNow() async {
-        await reloadContainers()
+        await perform("正在刷新容器列表…") {
+            await self.reloadContainers()
+        }
     }
 
     func startContainer(_ container: DockerContainerInfo) async {
@@ -886,6 +1066,7 @@ final class AppModel: ObservableObject {
     }
 
     func removeContainer(_ container: DockerContainerInfo) async {
+        guard !isBusy && !isActionPending else { return }
         let alert = NSAlert()
         alert.messageText = "删除容器 \(container.name)？"
         alert.informativeText = "容器内安装的软件和包数据会被删除（home volume 保留）。Graft 会同时移除该容器对应的 .app 封装和安装记录。"
@@ -893,7 +1074,10 @@ final class AppModel: ObservableObject {
         alert.addButton(withTitle: "删除")
         alert.addButton(withTitle: "取消")
         NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        isActionPending = true
+        let accepted = alert.runModal() == .alertFirstButtonReturn
+        isActionPending = false
+        guard accepted else { return }
 
         await perform("正在删除容器 \(container.name)…") {
             try await self.orchestrator.removeContainer(named: container.name)
@@ -902,6 +1086,9 @@ final class AppModel: ObservableObject {
                 try? FileManager.default.removeItem(at: app.bundleURL)
             }
             InstallationRegistry.shared.remove(containerName: container.name)
+            if container.name == self.environment.currentContainerName {
+                self.environment.environmentName = ""
+            }
             self.installations = InstallationRegistry.shared.all()
             self.wrappedApps = Self.scanWrappedApps()
             await self.environment.refresh()
@@ -915,12 +1102,15 @@ final class AppModel: ObservableObject {
         let base = environment.baseImage
         let alert = NSAlert()
         alert.messageText = "卸载 \(preset.name)？"
-        alert.informativeText = "Graft 将尝试从 \(base.displayName) 容器（\(base.containerName)）移除该软件，并删除对应的 macOS .app 封装。共享依赖不会被删除。"
+        alert.informativeText = "Graft 将尝试从 \(base.displayName) 容器（\(environment.currentContainerName)）移除该软件，并删除对应的 macOS .app 封装。共享依赖不会被删除。"
         alert.alertStyle = .warning
         alert.addButton(withTitle: "卸载")
         alert.addButton(withTitle: "取消")
         NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        isActionPending = true
+        let accepted = alert.runModal() == .alertFirstButtonReturn
+        isActionPending = false
+        guard accepted else { return }
         await performUninstall(preset, base: base)
     }
 
@@ -928,19 +1118,19 @@ final class AppModel: ObservableObject {
         await perform("正在卸载 \(preset.name)…") {
             let progress = self.progressHandler()
             let target = self.orchestrator(for: base)
-            let containerExists = self.containers.contains { $0.name == base.containerName }
+            let containerExists = self.containers.contains { $0.name == target.containerName }
             if self.environment.colimaState == .running && containerExists {
                 try? await target.uninstall(preset, progress: progress)
             } else {
-                self.log.append("容器 \(base.containerName) 未运行，仅移除 .app 封装。", level: .warning)
+                self.log.append("容器 \(target.containerName) 未运行，仅移除 .app 封装。", level: .warning)
             }
 
             var bundlePaths = Set<String>()
-            for record in self.installations where record.presetID == preset.id && record.baseImage == base {
+            for record in self.installations where record.presetID == preset.id && record.containerName == target.containerName {
                 if let path = record.bundlePath { bundlePaths.insert(path) }
             }
             for app in self.wrappedApps where
-                (app.baseImage == base || app.containerName == base.containerName)
+                app.containerName == target.containerName
                 && self.matchesPreset(app, preset) {
                 bundlePaths.insert(app.bundleURL.path)
             }
@@ -949,7 +1139,7 @@ final class AppModel: ObservableObject {
             }
             InstallationRegistry.shared.remove(
                 presetID: preset.id,
-                containerName: base.containerName
+                containerName: target.containerName
             )
             self.installations = InstallationRegistry.shared.all()
             self.wrappedApps = Self.scanWrappedApps()

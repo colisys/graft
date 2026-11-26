@@ -21,6 +21,13 @@ struct MenuBarView: View {
                 }
             }
 
+            if let toast = model.toast {
+                Label(toast, systemImage: "info.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             Divider().opacity(0.6)
             appsSection
             Divider().opacity(0.6)
@@ -28,12 +35,13 @@ struct MenuBarView: View {
         }
         .padding(16)
         .frame(width: 340)
-        .task { await model.refresh() }
+
         .alert("出错了", isPresented: $model.showingError) {
             if model.shouldOfferRuntimeRecovery {
                 Button("启动运行环境") {
                     Task { await model.requestStartRuntime() }
                 }
+                .disabled(model.isBusy || model.isActionPending)
             }
             Button("好", role: .cancel) {}
         } message: {
@@ -95,13 +103,13 @@ struct MenuBarView: View {
                     }
                 }
                 .controlSize(.small)
-                .disabled(model.isBusy)
+                .disabled(model.isBusy || model.isActionPending)
 
                 Button("刷新") {
                     Task { await model.refresh() }
                 }
                 .controlSize(.small)
-                .disabled(model.isBusy)
+                .disabled(model.isBusy || model.isActionPending)
 
                 Button("管理窗口") {
                     model.showManagementWindow()
@@ -161,6 +169,7 @@ struct MenuBarView: View {
                 Image(systemName: "play.fill")
             }
             .buttonStyle(.borderless)
+            .disabled(model.isBusy || model.isActionPending)
             .help("启动 \(app.name)")
         }
         .contentShape(Rectangle())
