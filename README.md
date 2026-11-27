@@ -422,6 +422,24 @@ shim 同时拦截 Xlib 与 XCB 的 XRandR 响应，只改写客户端看到的�
 
 「设置 → 图形性能 → 最大刷新率」可选：匹配 macOS、30、60、120 Hz、不限制（旧行为）。上限不会超过当前显示器刷新率；例如显示器是 60 Hz 时，选择 120 Hz 实际仍按 60 Hz 上报。已封装 `.app` 的启动脚本会在下次启动 Graft 时按当前设置自动重写（正在运行的应用会跳过，下次启动再更新）；正在运行的 Linux 应用需重启。若 shim 无法加载，Graft 会回退到旧的 `--disable-frame-rate-limit` 行为。
 
+### 8.6 macOS Wayland compositor（最小实现）
+
+`exp-wayland` 中包含一个最小 macOS Wayland compositor：
+
+```sh
+swift run GraftWaylandCompositor
+```
+
+它会启动本地 Wayland socket、创建一个 AppKit 窗口，并由内置 demo client 通过 Wayland 协议提交一张共享内存渐变 surface。当前支持：
+
+- `wl_display` / `wl_registry`
+- `wl_compositor` / `wl_surface`
+- `wl_shm` / `wl_shm_pool` / `wl_buffer`
+- `xdg_wm_base` / `xdg_surface` / `xdg_toplevel`
+- ARGB8888 shared-memory surface 显示
+
+限制：单客户端、无输入、无 subsurfaces、无 GPU/dmabuf、暂无 Linux 容器传输层，也尚未接入 Graft 的 `.app` 启动器。这是 compositor 核心的第一个可运行里程碑，不是完整 Wayland 桌面。
+
 ### 8.5 Wayland 实验
 
 Linux 侧最小冒烟测试：

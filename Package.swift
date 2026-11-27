@@ -14,12 +14,29 @@ let package = Package(
     products: [
         .executable(name: "Graft", targets: ["GraftApp"]),
         .executable(name: "GraftLauncher", targets: ["GraftLauncher"]),
-        .library(name: "GraftCore", targets: ["GraftCore"])
+        .library(name: "GraftCore", targets: ["GraftCore"]),
+        .library(name: "GraftWayland", targets: ["GraftWayland"]),
+        .executable(name: "GraftWaylandCompositor", targets: ["GraftWaylandCompositor"])
     ],
     targets: [
         .target(
             name: "GraftCore",
             path: "Sources/GraftCore"
+        ),
+        .target(
+            name: "GraftWaylandC",
+            path: "Sources/GraftWaylandC",
+            publicHeadersPath: "include"
+        ),
+        .target(
+            name: "GraftWayland",
+            dependencies: ["GraftWaylandC"],
+            path: "Sources/GraftWayland"
+        ),
+        .executableTarget(
+            name: "GraftWaylandCompositor",
+            dependencies: ["GraftWayland"],
+            path: "Sources/GraftWaylandCompositor"
         ),
         .executableTarget(
             name: "GraftApp",
@@ -34,6 +51,11 @@ let package = Package(
             name: "GraftCoreTests",
             dependencies: ["GraftCore"],
             path: "Tests/GraftCoreTests"
+        ),
+        .testTarget(
+            name: "GraftWaylandTests",
+            dependencies: ["GraftWayland"],
+            path: "Tests/GraftWaylandTests"
         )
     ]
 )
