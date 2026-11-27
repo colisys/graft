@@ -311,6 +311,13 @@ struct SettingsView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
+            if environment.electronGPUEnabled {
+                Label("XQuartz 没有 Apple GPU 直通。若 VS Code 等 Electron 应用卡顿或日志出现 ANGLE/EGL 初始化失败，请关闭此开关并重启应用。", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             Picker("最大刷新率", selection: $environment.maxRefreshRateMode) {
                 Text("匹配 macOS（\(environment.detectedRefreshRate) Hz）")
                     .tag(MaxRefreshRateMode.matchDisplay)
@@ -321,6 +328,11 @@ struct SettingsView: View {
             }
             .pickerStyle(.menu)
             .disabled(model.isBusy || model.isActionPending)
+
+            Text("实际上限不会超过当前显示器（\(environment.detectedRefreshRate) Hz）；选择更高数值会被自动压到该上限。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
 
             Text("XQuartz 的 rootless 模式把 XRandR 刷新率硬编码为 1 Hz，Chromium / Electron 会据此把界面限到约 1–2 fps。Graft 随包提供一个小型 Linux XRandR shim（源码在 Resources/Shims），只改写 X11 客户端看到的刷新率，不修改 XQuartz；应用会按此上限合成画面，既能正常刷新，又不会无限渲染。选择「不限制」才会使用旧的 --disable-frame-rate-limit。已封装的 .app 会在下次启动 Graft 时自动升级启动脚本；运行中的应用需重启。")
                 .font(.caption)

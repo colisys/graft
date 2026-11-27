@@ -7,12 +7,24 @@ final class RefreshRateTests: XCTestCase {
         XCTAssertEqual(MaxRefreshRateMode.matchDisplay.resolvedHz(detected: 0), 60)
         XCTAssertEqual(MaxRefreshRateMode.hz30.resolvedHz(detected: 120), 30)
         XCTAssertEqual(MaxRefreshRateMode.hz60.resolvedHz(detected: 120), 60)
-        XCTAssertEqual(MaxRefreshRateMode.hz120.resolvedHz(detected: 60), 120)
+        XCTAssertEqual(MaxRefreshRateMode.hz60.resolvedHz(detected: 30), 30)
+        XCTAssertEqual(MaxRefreshRateMode.hz120.resolvedHz(detected: 60), 60)
+        XCTAssertEqual(MaxRefreshRateMode.hz120.resolvedHz(detected: 144), 120)
         XCTAssertNil(MaxRefreshRateMode.unlimited.resolvedHz(detected: 60))
     }
 
     func testDetectedRefreshRateIsPositive() {
         XCTAssertGreaterThan(DisplayRefreshRate.current(), 0)
+    }
+
+    func testHostDefaultsLeaveOneCoreForMacOS() {
+        let host = HostResources(
+            architecture: .x86_64,
+            cpuCount: 4,
+            physicalMemoryBytes: 16 * 1_073_741_824
+        )
+        XCTAssertEqual(host.recommendedColimaCPU, 3)
+        XCTAssertEqual(host.recommendedColimaMemoryGB, 6)
     }
 
     func testShimFilesAreAvailableForSupportedImages() {

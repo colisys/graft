@@ -420,7 +420,14 @@ GRAFT_MAX_REFRESH=<目标 Hz>
 
 shim 同时拦截 Xlib 与 XCB 的 XRandR 响应，只改写客户端看到的刷新率，不修改 XQuartz。Chromium 因此按所选上限（默认匹配 macOS，例如 60/120 Hz）合成，而不是 1 Hz 或无限帧率。
 
-「设置 → 图形性能 → 最大刷新率」可选：匹配 macOS、30、60、120 Hz、不限制（旧行为）。已封装 `.app` 的启动脚本会在下次启动 Graft 时自动升级；正在运行的 Linux 应用需重启，旧 `.app` 若未升级则重新封装。若 shim 无法加载，Graft 会回退到旧的 `--disable-frame-rate-limit` 行为。
+「设置 → 图形性能 → 最大刷新率」可选：匹配 macOS、30、60、120 Hz、不限制（旧行为）。上限不会超过当前显示器刷新率；例如显示器是 60 Hz 时，选择 120 Hz 实际仍按 60 Hz 上报。已封装 `.app` 的启动脚本会在下次启动 Graft 时自动升级；正在运行的 Linux 应用需重启，旧 `.app` 若未升级则重新封装。若 shim 无法加载，Graft 会回退到旧的 `--disable-frame-rate-limit` 行为。
+
+### 8.4.2 性能取舍
+
+- **Colima CPU**：Graft 最多分配 `host CPU - 1` 个 vCPU，至少给 macOS/XQuartz 留一个核心。4 核机器不要给 VM 4 核，否则 WindowServer、XQuartz 会和 VS Code 抢 CPU。
+- **Colima 内存**：16 GiB 主机默认 6 GiB，8 GiB 主机默认 4 GiB。修改后需要休眠并重新启动 Colima 才会生效。
+- **Electron GPU（实验性）**：XQuartz 没有 Apple GPU 直通，开启后 Chromium/Electron 仍会回退软件渲染，且可能产生 ANGLE/EGL 初始化错误。VS Code 这类 Electron 应用建议保持关闭；Chromium 浏览器本身不受这个 Electron 开关影响，所以两者卡顿程度会不同。
+- **VS Code 比 Chromium 重得多**：VS Code 有扩展宿主、文件监听、渲染进程和大量 X11 绘制；Chromium 的渲染路径更简单。对性能敏感时，macOS 原生 VS Code + Remote-Containers/SSH 仍是首选。
 
 ### 8.5 宿主目录
 
@@ -508,7 +515,7 @@ make uninstall PURGE=1       # 同时删除 ~/Library/Application Support/Graft 
 
 ```bash
 swift build          # 编译全部 target
-swift test           # 75 个单元测试
+swift test           # 76 个单元测试
 swift run Graft      # 调试运行
 ```
 

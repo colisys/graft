@@ -71,10 +71,12 @@ public struct HostResources: Sendable {
         min(4, max(2, cpuCount - 1))
     }
 
-    /// 4 GiB is the practical minimum for Electron apps in a GUI container;
-    /// very small hosts get 2 GiB so macOS remains usable.
+    /// 4 GiB is the practical minimum for Electron apps in a GUI container.
+    /// 16 GiB hosts get 6 GiB because VS Code + Chromium + XQuartz share the
+    /// machine; macOS keeps the rest.
     public var recommendedColimaMemoryGB: Int {
         let gigabytes = Int(physicalMemoryBytes / 1_073_741_824)
+        if gigabytes >= 16 { return 6 }
         return gigabytes >= 8 ? 4 : 2
     }
 

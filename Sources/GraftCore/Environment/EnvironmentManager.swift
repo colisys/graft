@@ -181,7 +181,9 @@ public final class EnvironmentManager: ObservableObject {
     }
 
     public var maxColimaCPU: Int {
-        max(2, min(8, host.cpuCount))
+        // Keep one host core for macOS and XQuartz. Giving the VM every core
+        // makes VS Code and the X11 bridge compete with WindowServer.
+        max(2, min(8, max(1, host.cpuCount - 1)))
     }
 
     public var maxColimaMemoryGB: Int {
@@ -255,7 +257,7 @@ public final class EnvironmentManager: ObservableObject {
         let hostResources = HostResources.current
         let storedCPU = UserDefaults.standard.integer(forKey: Self.colimaCPUDefaultsKey)
         let cpu = storedCPU > 0 ? storedCPU : hostResources.recommendedColimaCPU
-        let maxCPU = max(2, min(8, hostResources.cpuCount))
+        let maxCPU = max(2, min(8, max(1, hostResources.cpuCount - 1)))
         self.colimaCPU = min(max(cpu, 2), maxCPU)
 
         let storedMemory = UserDefaults.standard.integer(forKey: Self.colimaMemoryDefaultsKey)

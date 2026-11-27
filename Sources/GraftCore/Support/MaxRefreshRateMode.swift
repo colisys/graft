@@ -25,15 +25,16 @@ public enum MaxRefreshRateMode: String, CaseIterable, Identifiable, Sendable {
 
     /// Returns the cap in Hz, or nil for the legacy unlimited mode.
     public func resolvedHz(detected: Int) -> Int? {
+        let displayCap = max(1, detected > 0 ? detected : 60)
         switch self {
         case .matchDisplay:
-            return max(1, detected > 0 ? detected : 60)
+            return displayCap
         case .hz30:
-            return 30
+            return min(30, displayCap)
         case .hz60:
-            return 60
+            return min(60, displayCap)
         case .hz120:
-            return 120
+            return min(120, displayCap)
         case .unlimited:
             return nil
         }
