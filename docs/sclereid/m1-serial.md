@@ -1,30 +1,21 @@
 # M1: Alpine → host over virtserialport
 
-**Full frames missed the 1080p60 target:** 11.34–18.94 MiB/s verified, versus 474.61 MiB/s required for raw BGRA. A synthetic 256×256 damage rectangle reached 25.61–28.59 MiB/s (60/s requires 15 MiB/s), but its p99 host completion interval exceeded 45 ms in every measured round. This supports testing damage aggregation, not claiming smooth presentation.
+**Latest local i9: 158.52–164.89 MiB/s** verified full-frame throughput over three measured rounds (Core i9-9980HK, macOS 14.8.9, QEMU 11.1.3/HVF; see [local M1 acceptance](m1-memory.md#local-m1-acceptance)). The earlier i5 run reached 11.34–18.94 MiB/s. Both fell short of the 474.61 MiB/s byte budget for raw 1080p60 BGRA.
+
+On the i5, 256×256 damage tiles reached 25.61–28.59 MiB/s (60 tiles/s requires 15 MiB/s), but p99 host completion intervals exceeded 45 ms in every measured round.
 
 ## Reproduce
 
-From the repository root on the M0 Intel macOS/HVF machine (Python 3, curl, bsdtar, QEMU 11.1.2):
-
 ```sh
-qemu-system-x86_64 -machine q35 -chardev help
-qemu-system-x86_64 -device virtio-serial-pci,help
-qemu-system-x86_64 -device virtserialport,help
 python3 scripts/sclereid-m1-serial.py --probe-only
 python3 scripts/sclereid-m1-serial.py
 ```
 
-Both commands accept `--iso PATH` instead of downloading; both enforce M0's pinned Alpine virt 3.22.2 x86_64 digest. Local help confirmed socket chardev and port `nr`, `name`, `chardev`. The VM uses the M0 direct kernel/initramfs/CD boot, q35/HVF, host CPU, one default vCPU, 512 MiB, no NIC or display. The legacy console handles login and job setup only. A PCI virtio-serial controller has numbered ports 1 (probe/echo) and 2 (bulk), each backed by a separate Unix stream. Host listeners are created before spawn. Only the spawned VM is terminated (five-second grace then kill); boot files and sockets are temporary. No Colima.
+From the repository root on an Intel Mac with HVF, `qemu-system-x86_64`, `curl`, and `bsdtar`. Both commands accept `--iso PATH` to skip the download and check the pinned Alpine virt 3.22.2 x86_64 digest. The probe verifies a 24-byte guest-to-host nonce; the benchmark repeats the check before timing.
 
-## Measurement and limits
+## Earlier i5 results
 
-The probe-only boot passed first: the guest wrote a fresh known 24-byte nonce, matched byte-for-byte on the host port. A second boot repeated that check before timing. Round 0 is warm-up; 1–3 are measured. Each idle RTT round has 200 sequential numbered nine-byte request/echo pairs. Loaded RTT overlaps the whole host bulk job (including startup/drain): 16 full frames on the sibling port. RTT includes guest shell scheduling; it is not a device-only latency.
-
-Full uses 32 × 8,294,400 bytes (1920×1080×4); damage uses 128 × 262,144 bytes (256×256×4). Guest `cat` streams alternating prebuilt constant-byte buffers without pacing; host checks every byte and every eight-byte sequence header. All expected frames and replies verified; no missing or out-of-order frame observed. Rates exclude headers. Intervals are between host verification completions (first from start of reception); slash-separated values are nearest-rank p50/p95/p99 milliseconds, all on one host monotonic clock. Full-frame p99 with 32 samples is the maximum. CPU seconds cover the Python host process including its receiver thread, not QEMU or guest CPU. This measures a copying shell/Python implementation, not peak device bandwidth, real application damage, or input-to-display latency.
-
-## Recorded output
-
-RTT rows: latency distribution; loaded also reports echo count and concurrent MiB/s. Frame rows: effective MiB/s then interval distribution.
+Intel i5-3210M, QEMU 11.1.2/HVF. All expected frames and replies verified. Round 0 is warmup; rounds 1–3 are measured.
 
 ```text
 PASS guest->host nonce
@@ -45,3 +36,11 @@ damage 1 25.61 7.252/15.925/51.981 hostCPU_s=0.264
 damage 2 26.41 5.961/26.490/45.823 hostCPU_s=0.240
 damage 3 28.59 6.118/16.387/66.082 hostCPU_s=0.229
 ```
+
+## Setup and measurement
+
+The VM boots directly from the kernel/initramfs with the Alpine ISO, using q35/HVF, host CPU, one vCPU, 512 MiB RAM, and no NIC or display. The legacy console handles login and setup. Virtio-serial port 1 carries probe/echo and port 2 carries bulk data; each uses a separate Unix stream with a host listener created before boot.
+
+Full rounds send 32 × 8,294,400 bytes (1920×1080×4); damage rounds send 128 × 262,144 bytes (256×256×4). Guest `cat` sends alternating prebuilt buffers without pacing; the host checks every byte and eight-byte sequence header. Frame rows report payload MiB/s (excluding headers), then host verification completion intervals. The first interval starts at reception start.
+
+Idle RTT uses 200 sequential numbered nine-byte request/echo pairs. Loaded RTT spans the bulk job (16 full frames on port 2, including startup and drain) and also reports echo count `n` and concurrent throughput `bulk` in MiB/s. RTT includes guest shell scheduling. All timing triples are nearest-rank p50/p95/p99 in milliseconds on the host monotonic clock; full-frame p99 is the maximum of 32 samples. `hostCPU_s` covers the Python host process, including its receiver thread.
