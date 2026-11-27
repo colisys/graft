@@ -5,15 +5,16 @@ Linux Wayland SHM → ext4 DAX / `virtio-pmem` → macOS AppKit。本机：Intel
 | 模式 | 本机结果 |
 |---|---|
 | 默认单帧 | 64×48 四色图案，12,288 字节全量校验；`DAX_FRAME_OK`、`WINDOW_OK` |
-| [Weston](#真实客户端weston-simple-shm) | 12 张 250×250 帧、3 张不同内容、协议关闭成功；`WESTON_OK` |
+| [Weston](#真实客户端weston-simple-shm) | 12 帧、4 张不同内容；250×250 → 320×280 resize 和原生关闭回程通过；`WESTON_OK` |
 | [动画](#动画基准) | 优化构建下 58.33–58.67 次提交/s；通知到图层提交 p95 约 4.3 ms |
 | [单 VM 多窗](#单-vm-多窗) | 8 窗平均 58.75 次提交/s，较单窗下降约 1.4%；`MULTI_OK` |
+| [异常断链](#异常断链) | 首帧尚未回执时终止 QEMU，宿主窗口回收；`DISCONNECT_OK` |
 
-上述三种单窗模式均输出 `CLEANUP_OK` 和 `SCLEREID_M2_OK`：来宾 socket 移除、VM 退出、帧端口 EOF 后宿主窗口关闭。
+默认单帧、动画和正常 Weston 模式均输出 `CLEANUP_OK` 和 `SCLEREID_M2_OK`：来宾 socket 移除、VM 退出、帧端口 EOF 后宿主窗口关闭。
 
 ## 复现
 
-验证入口为 [`sclereid-m2.py`](sclereid-m2.py)，来宾桥、AppKit 窗口程序和 Weston 依赖准备脚本均位于同一目录。在已登录桌面会话的 Intel Mac 上准备 QEMU/HVF、Python 3、Zig、Swift 命令行工具、`curl`、`bsdtar` 和 [Alpine standard 3.22.2 x86_64 ISO](../m1/m1-memory.md#default-probe-profile)。从仓库根目录运行：
+验证入口为 [`sclereid-m2.py`](sclereid-m2.py)，来宾桥、AppKit 窗口程序和 Weston 依赖准备脚本均位于同一目录。在已登录桌面会话的 Intel Mac 上准备 QEMU/HVF、Python 3.11+、Zig、Swift 命令行工具、`curl`、`bsdtar` 和 [Alpine standard 3.22.2 x86_64 ISO](../m1/m1-memory.md#default-probe-profile)。从仓库根目录运行：
 
 ```sh
 iso=/path/to/alpine-standard-3.22.2-x86_64.iso
@@ -28,9 +29,19 @@ python3 docs/sclereid/m2/sclereid-m2.py "$iso" --animate
 
 ## 真实客户端：Weston simple-shm
 
-`--weston` 从 `weston-clients-14.0.2-r1.apk` 运行原版 `weston-simple-shm`，不启动 Weston 合成器；使用 `--apks DIR` 时将这个 APK 一并放入缓存。桥实现 `xdg-shell` v1 单窗流程：空提交触发 configure，匹配的 `ack_configure` 后接收 SHM，按帧回调节流，收到回执才复用槽位。脚本检查帧序和非空不透明内容，通过内容摘要确认画面变化，最后请求 `xdg_toplevel.close` 并检查退出。
+`--weston` 从 `weston-clients-14.0.2-r1.apk` 运行原版 `weston-simple-shm`，不启动 Weston 合成器；使用 `--apks DIR` 时将这个 APK 一并放入缓存。桥实现 `xdg-shell` v1 单窗流程：空提交触发 configure，匹配的 `ack_configure` 后接收 SHM，按帧回调节流，收到回执才复用槽位。脚本检查帧序和非空不透明内容，通过内容摘要确认画面变化。
 
-下一步：原生关闭按钮、resize、缩放、输入、多窗协议兼容和异常断链，再跑 GTK/Qt 和 Electron。
+验收通过 AppKit `setContentSize` 触发 resize；桥发送新 configure，客户端回执后提交 320×280 的缓冲。脚本用 `performClose` 触发原生窗口关闭回调；宿主发送 `xdg_toplevel.close`，待客户端退出后关闭窗口。当前 AppKit 回程事件随动画提交转发，仍需验证无持续绘制的客户端。
+
+## 异常断链
+
+```sh
+python3 docs/sclereid/m2/sclereid-m2.py "$iso" --weston --disconnect
+```
+
+首帧提交后、归还槽位前终止本次 QEMU。宿主检测帧端口断开，关闭窗口输入并等 AppKit 确认回收。桥侧也增加了宿主端口断开与客户端提前退出的处理；上述用例验证的是 VM 丢失，未覆盖宿主端口单独断开、客户端崩溃或重连。
+
+下一步：独立于帧流的窗口事件回程、Retina 缓冲缩放、输入、多窗协议兼容和故障隔离，再跑 GTK/Qt 和 Electron。
 
 ## 动画基准
 

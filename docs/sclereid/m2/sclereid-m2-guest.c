@@ -48,12 +48,39 @@ static char ack_line[32];
 static size_t ack_len;
 
 enum { XDG_WIDTH = 640, XDG_HEIGHT = 480 };
-static int xdg, configured, slot_busy, closing, disconnected;
+static int xdg, configured, slot_busy, closing, disconnected, host_lost;
+static int min_width, min_height, max_width, max_height;
+static int queued_width, queued_height;
 static uint32_t configure_serial;
 static struct wl_resource *surface, *role, *toplevel, *callback;
 static int64_t monotonic_ns(void);
 
+static void send_configure(int w, int h) {
+    struct wl_array states = {0};
+    configure_serial = wl_display_next_serial(display);
+    wl_resource_post_event(toplevel, 0, w, h, &states);
+    wl_resource_post_event(role, 0, configure_serial);
+}
+
 static void xdg_command(void) {
+    int w, h, end = 0;
+    if (sscanf(ack_line, "XDG_SIZE %3d %3d%n", &w, &h, &end) == 2 &&
+        end > 0 && (size_t)end + 1 == ack_len && ack_line[end] == '\n') {
+        if (!toplevel || !configured || closing ||
+            w < 1 || w > XDG_WIDTH || h < 1 || h > XDG_HEIGHT)
+            fail("invalid XDG resize");
+        if (min_width && w < min_width) w = min_width;
+        if (min_height && h < min_height) h = min_height;
+        if (max_width && w > max_width) w = max_width;
+        if (max_height && h > max_height) h = max_height;
+        if (configure_serial) {
+            queued_width = w;
+            queued_height = h;
+        } else {
+            send_configure(w, h);
+        }
+        return;
+    }
     if (ack_len == sizeof("XDG_CLOSE\n") - 1 && !memcmp(ack_line, "XDG_CLOSE\n", ack_len)) {
         if (!toplevel || closing) fail("no active XDG toplevel to close");
         closing = 1;
@@ -94,19 +121,24 @@ static void acknowledge(void) {
 
 static int host_ready(int fd, uint32_t mask, void *data) {
     (void)data;
-    if (mask & (WL_EVENT_ERROR | WL_EVENT_HANGUP)) fail("host disconnected");
+    if (mask & (WL_EVENT_ERROR | WL_EVENT_HANGUP)) goto lost;
     char buf[256];
     ssize_t n = read(fd, buf, sizeof buf);
     if (n < 0 && (errno == EINTR || errno == EAGAIN)) return 0;
-    if (n <= 0) fail("cannot read host ACK");
+    if (n <= 0) goto lost;
     for (ssize_t i = 0; i < n; ++i) {
-        if (ack_len == sizeof ack_line) fail("overlong ACK line");
+        if (ack_len == sizeof ack_line - 1) fail("overlong ACK line");
         ack_line[ack_len++] = buf[i];
         if (buf[i] == '\n') {
-                    if (xdg) xdg_command(); else acknowledge();
-                    ack_len = 0;
-                }
+            ack_line[ack_len] = '\0';
+            if (xdg) xdg_command(); else acknowledge();
+            ack_len = 0;
+        }
     }
+    return 0;
+lost:
+    host_lost = 1;
+    wl_display_terminate(display);
     return 0;
 }
 
@@ -143,10 +175,7 @@ static void xdg_commit(void) {
     if (!toplevel) fail("expected XDG toplevel before commit");
     if (!pending) {
         if (!configured && !configure_serial) {
-            struct wl_array states = {0};
-            configure_serial = wl_display_next_serial(display);
-            wl_resource_post_event(toplevel, 0, 0, 0, &states); /* client chooses size */
-            wl_resource_post_event(role, 0, configure_serial);
+            send_configure(0, 0); /* client chooses initial size */
         }
         return;
     }
@@ -154,8 +183,9 @@ static void xdg_commit(void) {
     if (!closing) {
         if (slot_busy) fail("XDG frame before host ACK");
         struct wl_shm_buffer *b = wl_shm_buffer_get(pending);
-        if (!b || wl_shm_buffer_get_format(b) != WL_SHM_FORMAT_XRGB8888)
-            fail("expected XRGB8888 SHM buffer");
+        if (!b || (wl_shm_buffer_get_format(b) != WL_SHM_FORMAT_XRGB8888 &&
+                           wl_shm_buffer_get_format(b) != WL_SHM_FORMAT_ARGB8888))
+            fail("expected XRGB8888 or ARGB8888 SHM buffer");
         int w = wl_shm_buffer_get_width(b), h = wl_shm_buffer_get_height(b);
         int stride = wl_shm_buffer_get_stride(b);
         if (w <= 0 || w > XDG_WIDTH || h <= 0 || h > XDG_HEIGHT || stride < 4*w)
@@ -165,7 +195,8 @@ static void xdg_commit(void) {
         for (int y = 0; y < h; ++y) {
             unsigned char *row = frame + PREFIX + y*w*4;
             memcpy(row, src + (size_t)y*stride, w*4);
-            for (int x = 0; x < w; ++x) row[x*4+3] = 255;
+            if (wl_shm_buffer_get_format(b) == WL_SHM_FORMAT_XRGB8888)
+                for (int x = 0; x < w; ++x) row[x*4+3] = 255;
         }
         wl_shm_buffer_end_access(b);
         mark_slot(frame, 0);
@@ -301,15 +332,29 @@ static int shell_dispatch(const void *iface, void *target, uint32_t op,
     } else if (iface == &shell_surface && op == 1 && !toplevel) {
         ref = &toplevel; child = &shell_top;
     } else if (iface == &shell_surface && op == 4 && configure_serial &&
-               a[0].u == configure_serial && !configured) {
+               a[0].u == configure_serial) {
+        configure_serial = 0;
         configured = 1;
+        if (queued_width && !closing) {
+            send_configure(queued_width, queued_height);
+            queued_width = queued_height = 0;
+        }
+        return 0;
+    } else if (iface == &shell_top && (op == 7 || op == 8)) {
+        int w = a[0].i, h = a[1].i;
+        if (w < 0 || w > XDG_WIDTH || h < 0 || h > XDG_HEIGHT) {
+            wl_resource_post_error(r, 2, "invalid size constraint");
+            return 0;
+        }
+        if (op == 7) { max_width = w; max_height = h; }
+        else { min_width = w; min_height = h; }
         return 0;
     } else if ((iface == &shell_top && (op == 2 || op == 3)) || /* title/app_id: no decoration */
                (iface == &shell_surface && op == 3) || (iface == &shell_base && op == 3)) {
         return 0;
     } else {
-        fprintf(stderr, "unexpected XDG request: %s\n", msg->name);
-        exit(1);
+        wl_resource_post_error(r, 0, "unsupported or out-of-order XDG request: %s", msg->name);
+        return 0;
     }
     *ref = wl_resource_create(c, child, 1, a[0].n);
     if (!*ref) fail("creating XDG role");
@@ -325,19 +370,17 @@ static void bind_shell(struct wl_client *c, void *data, uint32_t version, uint32
 
 static void client_gone(struct wl_listener *listener, void *data) {
     (void)data;
+    wl_list_remove(&listener->link);
+    if (host_lost) return;
     if (xdg) {
-        /* A socket hangup can arrive together with queued destructor requests.
-         * Wayland cleans up any remaining resources after this notification. */
-        if (!closing || !published) fail("disconnect before XDG close/frame");
+        /* Wayland cleans up any resources still live at socket hangup. */
         disconnected = 1;
-        wl_list_remove(&listener->link);
         if (!slot_busy) wl_display_terminate(display);
         return;
     }
     if (ack_len || pending) fail("disconnect with unfinished frame/ACK");
     for (int i = 0; i < slots; ++i)
         if (held[i].buffer) fail("disconnect with occupied slot");
-    wl_list_remove(&listener->link);
     wl_display_terminate(display);
 }
 static void client_created(struct wl_listener *listener, void *data) {
@@ -348,8 +391,8 @@ static void client_created(struct wl_listener *listener, void *data) {
 
 static int server(const char *socket_name) {
     char path[48];
-        snprintf(path, sizeof path, "/mnt/frame%d", lane);
-        int fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0600);
+    snprintf(path, sizeof path, "/mnt/frame%d", lane);
+    int fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0600);
     if (fd < 0) sysfail("open /mnt/frame");
     struct statx st = {0};
     if (syscall(SYS_statx, fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &st)) sysfail("statx /mnt/frame");
@@ -378,9 +421,19 @@ static int server(const char *socket_name) {
     if (wl_display_add_socket(display, socket_name)) sysfail("Wayland socket");
     wl_display_run(display);
     if (acks) wl_event_source_remove(acks);
+    if (host_lost && animate) {
+        for (int i = 0; i < slots; ++i)
+            if (held[i].buffer) wl_list_remove(&held[i].destroy.link);
+        if (pending) wl_list_remove(&watch_buffer.link);
+    }
     wl_display_destroy_clients(display);
     wl_display_destroy(display);
     munmap(frame, slots * RANGE);
+    if (host_lost) return 1;
+    if (xdg && !closing) {
+        if (fputs("XDG_GONE\n", stdout) == EOF || fflush(stdout)) sysfail("stdout");
+        return 1;
+    }
     return published ? 0 : 1;
 }
 

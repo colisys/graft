@@ -25,7 +25,11 @@ static const struct wl_message surface_requests[] = {
 static const struct wl_message surface_events[] = { {"configure", "u", NULL} };
 static const struct wl_message top_requests[] = {
     {"destroy", "", NULL}, {"set_parent", "?o", top_types},
-    {"set_title", "s", NULL}, {"set_app_id", "s", NULL}
+    {"set_title", "s", NULL}, {"set_app_id", "s", NULL},
+    {"show_window_menu", "ouii", (const struct wl_interface *[]){ &wl_seat_interface, NULL, NULL, NULL }},
+    {"move", "ou", (const struct wl_interface *[]){ &wl_seat_interface, NULL }},
+    {"resize", "ouu", (const struct wl_interface *[]){ &wl_seat_interface, NULL, NULL }},
+    {"set_max_size", "ii", NULL}, {"set_min_size", "ii", NULL}
 };
 static const struct wl_message top_events[] = { {"configure", "iia", NULL}, {"close", "", NULL} };
 #define SHELL_INTERFACE(name, requests, events) \

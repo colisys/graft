@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import selectors
 import socket
+import struct
 import math
 import re
 import subprocess as sp
@@ -193,41 +194,82 @@ def play_animation(port, stream, region, window, report, slots, seconds, lane=0)
     return count
 
 
-def play_weston(port, stream, region, window, report):
+def play_weston(port, stream, region, window, report, abort_vm=None):
     offset = None
     frames = set()
-    size = 250 * 250 * 4
+    resized = False
+
+    def command(code):
+        window.stdin.write(struct.pack('<HH', 0, code))
+        events = []
+        while (event := report.until(b'\n', 10)) != b'COMMAND_OK':
+            events.append(event)
+        return events
+
     for tick in range(12):
         line = stream.until(b'\n', 15)
-        if line != f'XDG_FRAME 250 250 {tick}'.encode('ascii'):
+        if line == b'XDG_GONE':
+            raise ConnectionError('Wayland client disconnected before close')
+        match = re.fullmatch(rb'XDG_FRAME ([0-9]{1,3}) ([0-9]{1,3}) ([0-9]{1,4})', line)
+        if not match:
             raise ValueError(f'unexpected Weston frame: {line!r}')
+        width, height, sequence = map(int, match.groups())
+        if not (1 <= width <= 640 and 1 <= height <= 480 and sequence == tick):
+            raise ValueError(f'invalid Weston frame: {line!r}')
+        resized |= (width, height) == (320, 280) and tick > 0
+        size = width * height * 4
         if offset is None:
             offset = region.find(MARKER)
             if (offset < 0 or offset % 4096 or offset + len(MARKER) + size > len(region)
                     or region.find(MARKER, offset + 1) >= 0):
                 raise ValueError('expected one aligned Weston frame region')
-        if region[offset:offset + len(MARKER)] != MARKER:
-            raise ValueError('Weston frame marker changed')
+        if (region[offset:offset + len(MARKER)] != MARKER
+                or offset + len(MARKER) + size > len(region)):
+            raise ValueError('invalid Weston DAX frame range')
         base = offset + len(MARKER)
         frame = region[base:base + size]
         alpha = frame[slice(3, None, 4)]
         if alpha != b'\xff' * (size // 4) or not any(any(frame[slice(channel, None, 4)]) for channel in range(3)):
             raise ValueError('expected opaque nonblank Weston pixels')
         frames.add(hashlib.sha256(frame).digest())
-        remaining = memoryview(frame)
+        remaining = memoryview(struct.pack('<HH', width, height) + frame)
         while remaining:
             written = window.stdin.write(remaining)
             if not written:
                 raise OSError('window pipe made no progress')
             remaining = remaining[written:]
-        if not report.until(b'\n', 15).startswith(b'FRAME_OK '):
-            raise ValueError('Weston frame was not submitted to AppKit')
+        while not (event := report.until(b'\n', 15)).startswith(b'FRAME_OK '):
+            if event == b'CLOSE':
+                port.sendall(b'XDG_CLOSE\n')
+                port.sendall(f'XDG_ACK {tick}\n'.encode('ascii'))
+                if stream.until(b'\n', 15) != b'DONE':
+                    raise ValueError('expected client exit after close request')
+                return
+            if re.fullmatch(rb'SIZE [0-9]{1,3} [0-9]{1,3}', event):
+                port.sendall(b'XDG_' + event + b'\n')
+            else:
+                raise ValueError(f'unexpected AppKit event: {event!r}')
+        if tick == 0 and abort_vm is not None:
+            abort_vm()
+            try:
+                stream.until(b'\n', 10)
+            except (EOFError, ConnectionResetError):
+                return
+            raise RuntimeError('expected frame-port EOF after VM exit')
+        if tick == 0:
+            if b'SIZE 320 280' not in command(1):
+                raise ValueError('native resize did not emit a size event')
+            port.sendall(b'XDG_SIZE 320 280\n')
         if tick == 11:
+            if b'CLOSE' not in command(2):
+                raise ValueError('native close did not emit a close request')
             port.sendall(b'XDG_CLOSE\n')
         port.sendall(f'XDG_ACK {tick}\n'.encode('ascii'))
+    if not resized:
+        raise ValueError('client did not submit a 320×280 frame after resize')
     if len(frames) < 2 or stream.until(b'\n', 15) != b'DONE':
         raise ValueError('expected changing Weston frames and clean XDG close')
-    print(f'WESTON_OK: 12 frames, {len(frames)} distinct, xdg_toplevel.close completed', flush=True)
+    print(f'WESTON_OK: 12 frames, {len(frames)} distinct, native resize and xdg_toplevel.close completed', flush=True)
 
 
 def vm_command(work, iso, ports=1):
@@ -249,7 +291,7 @@ def vm_command(work, iso, ports=1):
     return cmd
 
 
-def run(work, iso, animate, slots, seconds, weston):
+def run(work, iso, animate, slots, seconds, weston, disconnect=False):
     cmd = vm_command(work, iso)
     with (work / 'region').open('xb+') as file:
         file.truncate(REGION_BYTES)
@@ -288,7 +330,24 @@ def run(work, iso, animate, slots, seconds, weston):
                 with child([work / 'window', *window_args], work) as window:
                     report = Reader(window.stdout.fileno())
                     if weston:
-                        play_weston(port, frame_port, region, window, report)
+                        try:
+                            play_weston(port, frame_port, region, window, report,
+                                        vm.kill if disconnect else None)
+                        except (EOFError, OSError, ValueError) as error:
+                            try:
+                                window.stdin.close()
+                                if report.until(b'\n', 10) != b'CLEANUP_OK' or window.wait(timeout=10):
+                                    error.add_note('AppKit cleanup acknowledgement missing')
+                            except (EOFError, OSError, sp.TimeoutExpired) as cleanup_error:
+                                error.add_note(f'AppKit cleanup failed: {cleanup_error}')
+                            raise
+                        if disconnect:
+                            vm.wait(timeout=10)
+                            window.stdin.close()
+                            if report.until(b'\n', 10) != b'CLEANUP_OK' or window.wait(timeout=10):
+                                raise RuntimeError('window cleanup failed after VM loss')
+                            print('DISCONNECT_OK: VM lost with frame in flight; window closed', flush=True)
+                            return
                     elif animate:
                         count = play_animation(port, frame_port, region, window, report, slots, seconds)
                         console.until(b'ANIM_STATS ', 10)
@@ -332,7 +391,10 @@ def main():
     modes.add_argument('--animate', action='store_true', help='benchmark 640x360 window updates at 60 Hz')
     parser.add_argument('--slots', type=int, choices=range(1, 5), default=1, help='animation pipeline depth (default: 1)')
     parser.add_argument('--seconds', type=int, default=3, help='animation duration, 1–30 seconds (default: 3)')
+    parser.add_argument('--disconnect', action='store_true', help='with --weston, stop QEMU after the first frame')
     args = parser.parse_args()
+    if args.disconnect and not args.weston:
+        parser.error('--disconnect requires --weston')
     if not 1 <= args.seconds <= 30 or (not args.animate and (args.slots != 1 or args.seconds != 3)):
         parser.error('--slots and --seconds are animation options; require 1–30 seconds')
     iso = args.iso.resolve(strict=True)
@@ -341,7 +403,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='scl-m2-', dir='/tmp') as directory:
         work = Path(directory)
         build(work, args.apks, args.weston)
-        run(work, iso, args.animate, args.slots, args.seconds, args.weston)
+        run(work, iso, args.animate, args.slots, args.seconds, args.weston, args.disconnect)
     print('SCLEREID_M2_OK', flush=True)
 
 

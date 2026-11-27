@@ -6,7 +6,7 @@
 |---|---|---|
 | M0 平台 | 本机通过 | 扩展 Intel 机型矩阵，记录 OS、QEMU、GPU 和驱动 |
 | M1 传输 | 本机选型完成 | 双槽 DAX 基线交给 M2；保留 TCP、串口和编码对照 |
-| M2 原生窗口 | Weston 单窗通过；单 VM 多窗性能基本满足本机使用要求 | 窗口缩放、原生关闭、输入、多窗协议兼容、异常断链；再跑 GTK/Qt 和 Electron |
+| M2 原生窗口 | Weston resize、原生关闭回程及 VM 断链清理通过；单 VM 多窗性能基本满足本机使用要求 | 独立窗口事件回程、Retina 缓冲缩放、输入、多窗协议兼容、故障隔离；再跑 GTK/Qt 和 Electron |
 | G1 GPU | 宿主 Metal compute 探针通过 | 确认 guest 硬件 renderer、宿主 API 和跨端呈现 |
 | M3 应用 | 待 M2、G1 | 测 VS Code 滚动与键入、轻量 3D 的帧时间和 CPU/GPU 开销 |
 
@@ -22,7 +22,7 @@
 
 ## M2 进展：单窗与单 VM 多窗
 
-[复现与结果](m2/m2-smoke.md)：Linux Wayland SHM → DAX → macOS AppKit。已验证固定图案、[连续动画](m2/m2-smoke.md#动画基准)和[原版 Weston 客户端](m2/m2-smoke.md#真实客户端weston-simple-shm)的 `xdg-shell` 配置与协议关闭。[单 VM 多窗](m2/m2-smoke.md#单-vm-多窗)的 1–8 窗测试中，每窗平均提交率从 59.60 降至 58.75 FPS。下一步补窗口协议功能，再微调槽深和节拍。默认显示后端仍是 XQuartz。
+[复现与结果](m2/m2-smoke.md)：Linux Wayland SHM → DAX → macOS AppKit。已验证固定图案、[连续动画](m2/m2-smoke.md#动画基准)和[原版 Weston 客户端](m2/m2-smoke.md#真实客户端weston-simple-shm)的 `xdg-shell` 配置、resize 与原生关闭回程；[异常断链](m2/m2-smoke.md#异常断链)已覆盖 VM 突然退出后的窗口回收。[单 VM 多窗](m2/m2-smoke.md#单-vm-多窗)的 1–8 窗测试中，每窗平均提交率从 59.60 降至 58.75 FPS。下一步补窗口协议功能，再微调槽深和节拍。默认显示后端仍是 XQuartz。
 
 ## 性能测量
 
