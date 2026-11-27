@@ -932,7 +932,7 @@ struct CustomInstallView: View {
             VStack(alignment: .leading, spacing: 12) {
                 GraftSectionTitle(
                     "源码编译 / 自定义命令",
-                    subtitle: "在 \(targetBase.displayName) 容器内以 graft 用户执行；可使用免密 sudo。"
+                    subtitle: "在 \(targetBase.displayName) 容器内以 graft 用户非交互执行；可使用免密 sudo。"
                 )
 
                 TextEditor(text: $model.sourceCommand)
@@ -980,6 +980,14 @@ struct CustomInstallView: View {
                 }
 
                 Label(
+                    "命令以非交互方式执行，pacman/apt 等确认提示会自动回答 y。安装普通软件包建议使用「软件包」模式。",
+                    systemImage: "terminal"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+                Label(
                     "执行完成后，新出现的 .desktop 会进入「容器应用」；Graft 也会扫描 /usr/local/share/applications。",
                     systemImage: "info.circle"
                 )
@@ -1003,7 +1011,8 @@ struct CustomInstallView: View {
                     )
                     Label("安装完成后，可在「容器应用」页手动选择要封装的 .desktop 条目。", systemImage: "info.circle")
                 } else {
-                    Label("命令在 Linux 容器内执行，不会在 macOS 宿主机执行。", systemImage: "info.circle")
+                    Label("命令在 Linux 容器内非交互执行；pacman/apt 等确认提示会自动回答 y。", systemImage: "info.circle")
+                    Label("安装普通软件包建议使用「软件包」模式，不需要把它当源码命令执行。", systemImage: "info.circle")
                     Label("编译工具会安装到 \(targetBase.displayName) 容器；首次使用会拉取基础镜像。", systemImage: "info.circle")
                     Label("源码编译的 .desktop 通常位于 /usr/local/share/applications。", systemImage: "info.circle")
                 }

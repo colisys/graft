@@ -656,8 +656,8 @@ public final class ContainerOrchestrator: @unchecked Sendable {
 
         let docker = try requireDocker()
         let logStore = log
-        let script = "set -e\n\(scriptBody)"
-        log.append("在 \(baseImage.displayName) 容器内执行源码安装命令", level: .command)
+        let script = SourceInstallCommand.nonInteractiveScript(for: scriptBody)
+        log.append("在 \(baseImage.displayName) 容器内非交互执行源码安装命令", level: .command)
 
         let result = try await runner.run(
             docker,

@@ -308,7 +308,7 @@ make app UNIVERSAL=0
 「自定义安装」页有两种模式：
 
 - **软件包**：输入当前基础镜像对应的 `apt` / `pacman` / `apk` 包名，例如 `thunderbird`、`firefox`、`obs-studio`；安装后自动尝试匹配同名 `.desktop`。
-- **源码 / 命令**：在容器内执行你提供的构建脚本（默认以 `graft` 用户运行，可使用免密 `sudo`）。可以勾选先安装编译工具（`build-essential` / `base-devel` / `build-base` 等）。命令执行完成后，Graft 会重新扫描 `.desktop`，可在「容器应用」中封装。
+- **源码 / 命令**：在容器内非交互执行你提供的构建脚本（默认以 `graft` 用户运行，可使用免密 `sudo`）。pacman/apt 等包管理器的确认提示会自动回答 `y`，所以像 `sudo pacman -Sy chromium` 这样的命令也能执行；普通软件包仍建议用「软件包」模式，并优先使用 `--noconfirm` / `-y`。可以勾选先安装编译工具（`build-essential` / `base-devel` / `build-base` 等）。命令执行完成后，Graft 会重新扫描 `.desktop`，可在「容器应用」中封装。
 
 源码模式示例：
 
@@ -460,6 +460,7 @@ shim 同时拦截 Xlib 与 XCB 的 XRandR 响应，只改写客户端看到的�
 | 启动应用时 XQuartz 总是跳到前台 / 出现在 Dock | 新 launcher 使用 `open -g` 后台启动 XQuartz，不再抢焦点；如需完全隐藏 Dock/Cmd-Tab，设置里点击「隐藏图标」（修改 Info.plist，自动备份，需要管理员）。 |
 | 中文显示为方块 | 确认镜像构建包含 Noto CJK 字体（`fonts-noto-cjk` / `noto-fonts-cjk` / `font-noto-cjk`）；重新构建基础镜像 |
 | Electron 应用闪退 | 确认容器以 `--shm-size=2g` 启动；日志中检查 `--no-sandbox` |
+| 源码命令停在 `Proceed with installation? [Y/n]` | 源码命令现在以非交互方式执行并自动回答 `y`；也可直接在命令中写 `--noconfirm` / `-y`。安装普通软件包时使用「软件包」模式更稳妥。 |
 | Electron 应用（VS Code / Chrome / Slack）卡顿、画面每秒只刷新一两次 | XQuartz rootless 模式报告 1 Hz 刷新率。新版 Graft 会通过 XRandR shim 向应用报告 macOS 刷新率；确认「设置 → 图形性能 → 最大刷新率」不是「不限制」以外的异常值，并重启应用。旧封装会在下次启动 Graft 时自动升级启动脚本。 |
 | 图标是占位图 | 该应用可能只有 `.xpm` 图标；安装 `librsvg` 或手动替换 `.icns` |
 | 生成的应用打不开 | 查看 `~/Library/Application Support/Graft/logs/<id>.log` |
@@ -507,7 +508,7 @@ make uninstall PURGE=1       # 同时删除 ~/Library/Application Support/Graft 
 
 ```bash
 swift build          # 编译全部 target
-swift test           # 73 个单元测试
+swift test           # 75 个单元测试
 swift run Graft      # 调试运行
 ```
 

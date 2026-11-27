@@ -726,7 +726,7 @@ final class AppModel: ObservableObject {
         let buildTools = installBuildTools
         requestInstallConsent(
             software: "自定义源码构建",
-            detail: "Graft 将在 \(base.displayName) 容器内以 graft 用户执行您提供的命令\(buildTools ? "，并先用 \(base.packageManager.displayName) 安装编译工具" : "")。命令可访问挂载的宿主目录，请只执行可信内容。"
+            detail: "Graft 将在 \(base.displayName) 容器内以 graft 用户非交互执行您提供的命令\(buildTools ? "，并先用 \(base.packageManager.displayName) 安装编译工具" : "")。包管理器确认提示会自动回答 yes。命令可访问挂载的宿主目录，请只执行可信内容。"
         ) {
             await self.performSourceInstall(command, base: base)
         }
