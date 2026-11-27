@@ -6,7 +6,7 @@ On the Intel i5-3210M, all 120 frames decoded before transport EOF in each of si
 
 ```sh
 s=$COMMANDCODE_SCRATCHPAD
-python3 scripts/sclereid-m1-encoder.py --live-h264 --ffmpeg "$s/encoder-ffmpeg" \
+python3 docs/sclereid/m1/sclereid-m1-encoder.py --live-h264 --ffmpeg "$s/encoder-ffmpeg" \
   --guest "$s/std.iso" "$s/encoder-linux"
 ```
 

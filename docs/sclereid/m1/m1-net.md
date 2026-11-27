@@ -5,7 +5,7 @@
 ## Reproduce
 
 ```sh
-python3 scripts/sclereid-m1-net.py
+python3 docs/sclereid/m1/sclereid-m1-net.py
 ```
 
 From the repository root on an Intel Mac with HVF, `qemu-system-x86_64`, `curl`, and `bsdtar`. Pass a local Alpine virt 3.22.2 x86_64 ISO as the sole argument to skip the download. The script checks the pinned SHA-256 before boot.

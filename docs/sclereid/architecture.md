@@ -1,6 +1,6 @@
 # Sclereid：Linux Wayland 到 macOS 窗口
 
-当前实验路径在 Alpine/HVF VM 内终结 Wayland，在 macOS 上用 AppKit 呈现。M1 选用双槽 `virtio-pmem` / ext4 DAX 加独立的 virtio-serial 通道；M2 已跑通 SHM 单窗和 `weston-simple-shm` 的 `xdg-shell` 单窗口流程。参见 [M1 本机数据](m1-memory.md#local-m1-acceptance)和 [M2 复现](m2-smoke.md)。应用启动器的默认后端仍为 XQuartz。
+当前实验路径在 Alpine/HVF VM 内终结 Wayland，在 macOS 上用 AppKit 呈现。M1 选用双槽 `virtio-pmem` / ext4 DAX 加独立的 virtio-serial 通道；M2 已跑通 SHM 单窗和 `weston-simple-shm` 的 `xdg-shell` 单窗口流程。参见 [M1 本机数据](m1/m1-memory.md#local-m1-acceptance)和 [M2 复现](m2/m2-smoke.md)。应用启动器的默认后端仍为 XQuartz。
 
 ## 组件与所有权
 
@@ -17,7 +17,7 @@ Linux 应用 ⇄ 私有 Wayland socket ⇄ Linux 合成器/桥
 | Mac 窗口宿主 | 接入时按 `(会话代次, 窗口 ID)` 管理 `NSWindow`；主线程更新 AppKit，读帧与解码留在后台。更新帧不抢焦点，关闭窗口先请求客户端退出。 |
 | GraftCore 会话协调器（待接入） | 在 `DisplayBackend.swift` / `DisplaySession` 解析请求与实际后端；将纯配置与 prepare/start/stop 分开。沿用 `GraftLauncher` 的 `.app`、`launch.sh` 与 `SessionRegistry` 的会话盘点。 |
 
-现有 `GraftWayland` / `GraftWaylandCompositor` 本机 demo 和 `scripts/wayland-smoke.sh` 分别作为宿主像素、Linux 协议对照。
+现有 `GraftWayland` / `GraftWaylandCompositor` 本机 demo 和 [`wayland-smoke.sh`](smoke/wayland-smoke.sh) 分别作为宿主像素、Linux 协议对照。
 
 ## 两套协议的边界
 

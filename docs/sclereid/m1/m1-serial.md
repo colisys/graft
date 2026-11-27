@@ -7,8 +7,8 @@ On the i5, 256×256 damage tiles reached 25.61–28.59 MiB/s (60 tiles/s require
 ## Reproduce
 
 ```sh
-python3 scripts/sclereid-m1-serial.py --probe-only
-python3 scripts/sclereid-m1-serial.py
+python3 docs/sclereid/m1/sclereid-m1-serial.py --probe-only
+python3 docs/sclereid/m1/sclereid-m1-serial.py
 ```
 
 From the repository root on an Intel Mac with HVF, `qemu-system-x86_64`, `curl`, and `bsdtar`. Both commands accept `--iso PATH` to skip the download and check the pinned Alpine virt 3.22.2 x86_64 digest. The probe verifies a 24-byte guest-to-host nonce; the benchmark repeats the check before timing.

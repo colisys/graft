@@ -445,7 +445,7 @@ swift run GraftWaylandCompositor
 Linux 侧最小冒烟测试：
 
 ```sh
-./scripts/wayland-smoke.sh
+./docs/sclereid/smoke/wayland-smoke.sh
 ```
 
 该脚本在临时 Arch 容器里启动 Weston headless，并用 `wayland-info` 验证 `wl_compositor`、`xdg_wm_base`、`wl_shm`、`wl_output` 等协议。它证明容器侧 Wayland 链路可用，但**不证明 Graft 已能在 macOS 上显示 Wayland 窗口**：当前 `WaylandDisplayBackend` 仍是 `implemented=false` 的占位实现，`.app` launcher 对 Wayland 会明确拒绝。macOS compositor 和输入/剪贴板/IME 仍是后续工作。

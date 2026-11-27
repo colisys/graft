@@ -12,21 +12,17 @@
 
 ## M0 平台基线
 
-```sh
-python3 scripts/sclereid-m0.py
-```
-
-Intel i5-3210M / macOS 13.7.8 / QEMU 11.1.2 和 Intel i9-9980HK / macOS 14.8.9 / QEMU 11.1.3 均通过：强制 HVF，校验 Alpine virt 3.22.2 镜像和来宾串口标记，QMP `quit` 后退出码为 0。
+两台 Intel Mac 均通过 HVF 启动和 QMP 退出检查。见 [M0 复现与结果](m0/README.md)。
 
 ## M1 收尾：本机传输选型完成
 
 采用双槽 `virtio-pmem` / ext4 DAX 传原始帧，用独立 virtio-serial 端口分隔帧通知/回执和控制。消费者读完才归还槽位；启动时确认 inode DAX。
 
-[i9 本机数据](m1-memory.md#local-m1-acceptance)：两次启动，全帧和局部更新各三轮、每轮 10 秒。1080p BGRA 为 474.51–474.58 MiB/s，256×256 局部更新为 15.00 MiB/s；各负载每轮验证 600/600，独立控制回显 100/100。对照：[virtio-serial](m1-serial.md)、[virtio-net TCP](m1-net.md)、[流式 H.264](m1-live-h264.md)。
+[i9 本机数据](m1/m1-memory.md#local-m1-acceptance)：1080p BGRA 为 474.51–474.58 MiB/s，256×256 局部更新为 15.00 MiB/s。对照：[virtio-serial](m1/m1-serial.md)、[virtio-net TCP](m1/m1-net.md)、[流式 H.264](m1/m1-live-h264.md)。
 
 ## M2 进展：跨 VM SHM 单窗通过
 
-[复现与结果](m2-smoke.md)：Linux Wayland SHM → DAX → macOS AppKit。已验证固定图案、[连续动画](m2-smoke.md#动画基准)和[原版 Weston 客户端](m2-smoke.md#真实客户端weston-simple-shm)的 `xdg-shell` 配置与协议关闭。先补窗口功能，再微调槽深和节拍。默认显示后端仍是 XQuartz。
+[复现与结果](m2/m2-smoke.md)：Linux Wayland SHM → DAX → macOS AppKit。已验证固定图案、[连续动画](m2/m2-smoke.md#动画基准)和[原版 Weston 客户端](m2/m2-smoke.md#真实客户端weston-simple-shm)的 `xdg-shell` 配置与协议关闭。先补窗口功能，再微调槽深和节拍。默认显示后端仍是 XQuartz。
 
 ## 性能测量
 

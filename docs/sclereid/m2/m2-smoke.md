@@ -12,13 +12,13 @@ Linux Wayland SHM → ext4 DAX / `virtio-pmem` → macOS AppKit。本机：Intel
 
 ## 复现
 
-在已登录桌面会话的 Intel Mac 上准备 QEMU/HVF、Python 3、Zig、Swift 命令行工具、`curl`、`bsdtar` 和 [Alpine standard 3.22.2 x86_64 ISO](m1-memory.md#default-probe-profile)。从仓库根目录运行：
+M2 验证脚本放在本地 `docs/sclereid/m2/`，不随仓库分发。在已登录桌面会话的 Intel Mac 上准备 QEMU/HVF、Python 3、Zig、Swift 命令行工具、`curl`、`bsdtar` 和 [Alpine standard 3.22.2 x86_64 ISO](../m1/m1-memory.md#default-probe-profile)。从仓库根目录运行：
 
 ```sh
 iso=/path/to/alpine-standard-3.22.2-x86_64.iso
-python3 scripts/sclereid-m2.py "$iso"
-python3 scripts/sclereid-m2.py "$iso" --weston
-python3 scripts/sclereid-m2.py "$iso" --animate
+python3 docs/sclereid/m2/sclereid-m2.py "$iso"
+python3 docs/sclereid/m2/sclereid-m2.py "$iso" --weston
+python3 docs/sclereid/m2/sclereid-m2.py "$iso" --animate
 ```
 
 脚本在宿主下载并校验固定版本的 APK；`--apks DIR` 改用缓存，仍做摘要校验。来宾无网卡，桥和动态库经只读 `fw_cfg` 载入。桥用 `statx` 确认 inode DAX；宿主只读映射临时 pmem 文件，帧通知与回执走 virtio-serial。
@@ -41,13 +41,13 @@ python3 scripts/sclereid-m2.py "$iso" --animate
 | `swiftc -O` 1 | 176 | 4 | 58.67 | 16.809/19.597/20.032 | 3.595/4.311/5.610 | 0.396 |
 | `swiftc -O` 2 | 175 | 5 | 58.33 | 16.593/20.123/21.843 | 3.640/4.255/5.054 | 0.497 |
 
-脚本默认使用 `swiftc -O`。提交速率以名义测试时长为分母，无预热。通知到提交从宿主读到通知到收到窗口进程确认，含校验、管道和主线程调度；图层操作包含 flush。这里测的是提交，不是屏幕呈现。性能按[路线图口径](roadmap.md#性能测量)比较。
+脚本默认使用 `swiftc -O`。提交速率以名义测试时长为分母，无预热。通知到提交从宿主读到通知到收到窗口进程确认，含校验、管道和主线程调度；图层操作包含 flush。这里测的是提交，不是屏幕呈现。性能按[路线图口径](../roadmap.md#性能测量)比较。
 
 ### 本机槽深对照（初步）
 
 ```sh
 for slots in 1 2 4; do
-  python3 scripts/sclereid-m2.py "$iso" --animate --seconds 10 --slots "$slots" || break
+  python3 docs/sclereid/m2/sclereid-m2.py "$iso" --animate --seconds 10 --slots "$slots" || break
 done
 ```
 

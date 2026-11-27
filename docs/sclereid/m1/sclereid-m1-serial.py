@@ -14,7 +14,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-M0 = runpy.run_path(str(Path(__file__).with_name('sclereid-m0.py')))
+M0 = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'm0' / 'sclereid-m0.py'))
 clock = time.perf_counter
 
 

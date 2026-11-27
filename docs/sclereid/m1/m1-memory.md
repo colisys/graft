@@ -1,6 +1,6 @@
 # M1: confined shared-region test on Intel macOS
 
-**Local transport decision:** Use ext4 DAX over dedicated file-backed virtio-pmem for M2 frame payloads. Separate virtio-serial ports carry frame notices/credits and control. Two i9 boots delivered 474.51–474.58 MiB/s for 1080p BGRA and 15.00 MiB/s for packed 256×256 damage. For window submission, see [M2](m2-smoke.md).
+**Local transport decision:** Use ext4 DAX over dedicated file-backed virtio-pmem for M2 frame payloads. Separate virtio-serial ports carry frame notices/credits and control. Two i9 boots delivered 474.51–474.58 MiB/s for 1080p BGRA and 15.00 MiB/s for packed 256×256 damage. For window submission, see [M2](../m2/m2-smoke.md).
 
 ## Default probe profile
 
@@ -8,9 +8,9 @@ From the repository root, use Python 3, `bsdtar`, Zig (tested 0.16.0), and `qemu
 
 ```sh
 iso=/path/to/alpine-standard-3.22.2-x86_64.iso
-python3 scripts/sclereid-m1-memory.py "$iso"
+python3 docs/sclereid/m1/sclereid-m1-memory.py "$iso"
 # Equivalent explicit profile
-python3 scripts/sclereid-m1-memory.py "$iso" --autonomous --verify-block 262144 --seconds 10 --rounds 3
+python3 docs/sclereid/m1/sclereid-m1-memory.py "$iso" --autonomous --verify-block 262144 --seconds 10 --rounds 3
 ```
 
 | Pinned ISO | Kernel | SHA-256 (checked by the script) |
@@ -54,11 +54,11 @@ Two separate boots on Intel Core i9-9980HK, macOS 14.8.9 (23J631), QEMU 11.1.3/H
 | 2 | damage | 2 | 15.00 | 2.217/3.377/3.701 | 0.673/1.669/2.341 | 0.432/1.810/0.296 |
 | 2 | damage | 3 | 15.00 | 2.293/3.331/3.734 | 0.621/1.506/1.813 | 0.428/1.800/0.294 |
 
-Same-host controls (`python3 scripts/sclereid-m1-serial.py` and `python3 scripts/sclereid-m1-net.py`) verified payloads but reached 158.52–164.89 and 63.45–66.34 MiB/s respectively for full frames over three rounds. Their copy and timing paths differ; these are not device bandwidth limits.
+Same-host controls (`python3 docs/sclereid/m1/sclereid-m1-serial.py` and `python3 docs/sclereid/m1/sclereid-m1-net.py`) verified payloads but reached 158.52–164.89 and 63.45–66.34 MiB/s respectively for full frames over three rounds. Their copy and timing paths differ; these are not device bandwidth limits.
 
 ## Historical transport runs
 
-Unless noted, these runs used Intel i5-3210M, macOS 13.7.8, MacPorts QEMU 11.1.2/q35/HVF and the same scratch-region confinement. Use the `iso` variable above for the pinned standard image and set `virt_iso` to the local pinned virt image. Where only flags are shown, append them to `python3 scripts/sclereid-m1-memory.py "$iso"`. Paced experiments use three 10-second rounds (600 ticks each) per load unless noted. A skip is an unissued or unpublished tick; a late completion excludes skips. `expired_wake` means the deadline passed before the issuer could start; `no_slot` counts unexpired attempts without a free slot. Host-paced age ends at host verification; guest-paced age ends at guest credit receipt and includes the return leg. Stage percentiles cover completed work and are not additive.
+Unless noted, these runs used Intel i5-3210M, macOS 13.7.8, MacPorts QEMU 11.1.2/q35/HVF and the same scratch-region confinement. Use the `iso` variable above for the pinned standard image and set `virt_iso` to the local pinned virt image. Where only flags are shown, append them to `python3 docs/sclereid/m1/sclereid-m1-memory.py "$iso"`. Paced experiments use three 10-second rounds (600 ticks each) per load unless noted. A skip is an unissued or unpublished tick; a late completion excludes skips. `expired_wake` means the deadline passed before the issuer could start; `no_slot` counts unexpired attempts without a free slot. Host-paced age ends at host verification; guest-paced age ends at guest credit receipt and includes the return leg. Stage percentiles cover completed work and are not additive.
 
 ### Options and evidence
 
@@ -72,7 +72,7 @@ Unless noted, these runs used Intel i5-3210M, macOS 13.7.8, MacPorts QEMU 11.1.2
 ### Reproduce and interpret
 
 ```sh
-python3 scripts/sclereid-m1-memory.py "$virt_iso" --raw
+python3 docs/sclereid/m1/sclereid-m1-memory.py "$virt_iso" --raw
 ```
 
 One warm-up plus three rounds of ten: all 31 full frames verified. The guest alternates tmpfs patterns, completes `dd conv=fsync` to `/dev/pmem0` before its serial reply, and waits for the next grant. Host checks the entire mapped prefix. Including control, copy, flush and verification, rounds delivered 32.16/33.51/35.61 MiB/s, median 226.99/228.22/220.51 ms and max 414.33/352.11/267.15 ms. This rules out the measured block/flush path for full frames at 60 Hz.
@@ -80,8 +80,8 @@ One warm-up plus three rounds of ten: all 31 full frames verified. The guest alt
 ### Follow-up: ext4 file mmap on the dedicated virtio-pmem device
 
 ```sh
-python3 scripts/sclereid-m1-memory.py "$iso" --fs
-python3 scripts/sclereid-m1-memory.py "$virt_iso" --fs
+python3 docs/sclereid/m1/sclereid-m1-memory.py "$iso" --fs
+python3 docs/sclereid/m1/sclereid-m1-memory.py "$virt_iso" --fs
 ```
 
 Load `virtio_pmem`, `nd_pmem`, `ext4`; install e2fsprogs offline from the ISO. The probe formats only scratch `/dev/pmem0` (`mkfs.ext4 -F -b 4096`). Standard has `CONFIG_ZONE_DEVICE=y` and `CONFIG_FS_DAX=y` and mounted `dax=always`; virt has `CONFIG_DAX=y` but lacked both options, rejected `dax=always` with `Invalid argument`, and reported `DAX=0 mask=1` on fallback. Neither supported `MAP_SYNC`. The host found the nonce-tagged warm-up frame at byte 6,475,776 in both fresh filesystems and verified every byte there before reuse; the offset is not an ABI.
@@ -97,7 +97,7 @@ The first buffered unsynced reply (`seq=11`) failed the byte check. The DAX unsy
 
 ### Follow-up: paced DAX ownership and control RTT
 
-`python3 scripts/sclereid-m1-memory.py "$iso" --paced --seconds 10 --rounds 3`
+`python3 docs/sclereid/m1/sclereid-m1-memory.py "$iso" --paced --seconds 10 --rounds 3`
 
 Single slot, 60 warm-up operations per round, full frames or packed damage cycling through bounded offsets. A serial grant starts each write; the guest fences and ACKs, and the host verifies the nonce and payload before reuse. The loaded ping queues behind every sixth scheduled write on the same connection (excludes host verification); idle pings have no writer.
 
@@ -109,7 +109,7 @@ Single slot, 60 warm-up operations per round, full frames or packed damage cycli
 
 ### Two-slot DAX pipeline and independent control
 
-`python3 scripts/sclereid-m1-memory.py "$iso" --ring --seconds 10 --rounds 3`
+`python3 docs/sclereid/m1/sclereid-m1-memory.py "$iso" --ring --seconds 10 --rounds 3`
 
 One second of warm-up per mode. The host can reserve a second slot before the first ACK is verified; `overlap` counts concurrent reservations, not concurrent writes. Separate 10 Hz nonce echoes measure host send-to-reply RTT. Full frames reached 448.93–452.08 MiB/s with 28–32 skips and 564–570 late per round. Damage reached 14.87–14.90 MiB/s with 4–5 skips and 10–20 late. Control p99 was 2.34–2.81 ms idle, 13.08–17.80 ms full, and 8.90–15.69 ms damage; the queued single-slot ping uses a different endpoint.
 
@@ -143,7 +143,7 @@ Use `--autonomous` alone for the original 64 KiB verifier run. Full frames verif
 
 ```sh
 for block in 65536 262144; do
-  python3 scripts/sclereid-m1-memory.py "$iso" --compare-producers --verify-block "$block" --seconds 10 --rounds 3 || exit 1
+  python3 docs/sclereid/m1/sclereid-m1-memory.py "$iso" --compare-producers --verify-block "$block" --seconds 10 --rounds 3 || exit 1
 done
 ```
 
@@ -191,10 +191,10 @@ Use Python 3.11+, `bsdtar`, the pinned standard ISO and the following FFmpeg bin
 - Guest FFmpeg 7.0.2: [static Linux amd64 archive](https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz), SHA-256 `abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67`. Extract with `tar -xOf linux.tar.xz ffmpeg-7.0.2-amd64-static/ffmpeg > linux-ffmpeg`; binary SHA-256 `e7e7fb30477f717e6f55f9180a70386c62677ef8a4d4d1a5d948f4098aa3eb99`. Use a matching cached archive if the rolling URL changes.
 
 ```sh
-python3 scripts/sclereid-m1-encoder.py --ffmpeg ./host-ffmpeg \
+python3 docs/sclereid/m1/sclereid-m1-encoder.py --ffmpeg ./host-ffmpeg \
   --guest "$iso" ./linux-ffmpeg --av1 libaom-av1 --av1-decoder libaom-av1
 # Separate host-only control
-python3 scripts/sclereid-m1-encoder.py --ffmpeg ./host-ffmpeg \
+python3 docs/sclereid/m1/sclereid-m1-encoder.py --ffmpeg ./host-ffmpeg \
   --av1 libaom-av1 --av1-decoder libaom-av1
 ```
 
@@ -227,7 +227,7 @@ The pinned Linux FFmpeg lacks SVT-AV1 and the macOS build lacks dav1d. Use stand
   svt_tar=$PWD/svt.tar
   tar -cf "$svt_tar" -C svt usr
   cd "$repo"
-  python3 scripts/sclereid-m1-encoder.py --ffmpeg ./host-ffmpeg \
+  python3 docs/sclereid/m1/sclereid-m1-encoder.py --ffmpeg ./host-ffmpeg \
     --guest "$iso" ./linux-ffmpeg --guest-svt-tar "$svt_tar" \
     --av1-decoder dav1d --av1-crfs 20 32 --repeats 2
   # For the motion quality control, replace the CRF options with:

@@ -1,6 +1,6 @@
 # Sclereid：Intel Mac 上的 Linux 图形栈选型
 
-**先用软件绘制跑通原生窗口，再验证 GPU。** [M2](m2-smoke.md) 已在 Intel/HVF 上跑通 `wl_shm → DAX → AppKit`。GPU 验证分三段：guest 渲染、跨 VM 图像交付、独立窗口呈现。Intel Mac 上的 MoltenVK 只解决宿主渲染 API。
+**先用软件绘制跑通原生窗口，再验证 GPU。** [M2](m2/m2-smoke.md) 已在 Intel/HVF 上跑通 `wl_shm → DAX → AppKit`。GPU 验证分三段：guest 渲染、跨 VM 图像交付、独立窗口呈现。Intel Mac 上的 MoltenVK 只解决宿主渲染 API。
 
 ## GPU 路线
 
@@ -24,7 +24,7 @@ rutabaga 的 Vulkan + Wayland 路径另有 Linux 参考要求：host 6.13+、gue
 
 | 阶段 | 操作与记录 |
 |---|---|
-| 软件基线 | 跑 [M2 smoke](m2-smoke.md)，再覆盖容器客户端的 resize、输入、缓冲复用和退出。Wayland FD 位于 `SCM_RIGHTS` 辅助数据中 [5]；TCP/vsock 字节流和共享目录不传内核对象。 |
+| 软件基线 | 跑 [M2 smoke](m2/m2-smoke.md)，再覆盖容器客户端的 resize、输入、缓冲复用和退出。Wayland FD 位于 `SCM_RIGHTS` 辅助数据中 [5]；TCP/vsock 字节流和共享目录不传内核对象。 |
 | 宿主 Vulkan | 记录 Mac 型号、实际 Metal GPU、macOS、x86_64 Loader/ICD 版本。运行 Vulkan 枚举、绘制和回读。`vtest` 可单测 renderer，不经过 VM 内存窗口。 |
 | Guest 渲染 | 核对 Colima/Lima 的 VMM 与有效配置；检查 virtio-gpu、`/dev/dri/renderD*`、capset、容器权限。用 EGL、`glxinfo -B`（GLX 对照）或 `vulkaninfo --summary` 检查驱动，配合离屏回读和宿主 GPU 活动。 |
 | 跨 VM 呈现 | 在同机验证双窗、同步和退出重连，与软件路径比较帧时间和内存峰值。零拷贝路径逐项验证格式/modifier、资源导入、生产者 fence、消费完成及回收；否则保留复制路径。 |
