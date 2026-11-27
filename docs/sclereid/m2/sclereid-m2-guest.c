@@ -24,7 +24,7 @@
 #endif
 
 enum { PREFIX = 32, FPS = 60, MAX_SLOTS = 4 };
-static int slots = 1, ticks = 3 * FPS;
+static int slots = 1, ticks = 3 * FPS, lane;
 static int animate, width = 64, height = 48;
 #define STRIDE (width * 4)
 #define PIXELS (STRIDE * height)
@@ -136,7 +136,7 @@ static void mark_slot(unsigned char *dst, unsigned slot) {
     };
     _Static_assert(sizeof inverted == PREFIX, "marker length");
     for (size_t i = 0; i < PREFIX - 1; ++i) dst[i] = (unsigned char)~inverted[i];
-    dst[PREFIX - 1] = 0x21 + slot;
+    dst[PREFIX - 1] = 0x21 + lane * MAX_SLOTS + slot;
 }
 
 static void xdg_commit(void) {
@@ -347,7 +347,9 @@ static void client_created(struct wl_listener *listener, void *data) {
 }
 
 static int server(const char *socket_name) {
-    int fd = open("/mnt/frame", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0600);
+    char path[48];
+        snprintf(path, sizeof path, "/mnt/frame%d", lane);
+        int fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0600);
     if (fd < 0) sysfail("open /mnt/frame");
     struct statx st = {0};
     if (syscall(SYS_statx, fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &st)) sysfail("statx /mnt/frame");
@@ -467,7 +469,7 @@ static void play(struct wl_surface *s, uint32_t *pool_pixels) {
         while (slot < slots && buffers[slot].deadline) ++slot;
         if (slot == slots) { ++no_slot; continue; }
         uint32_t *pixels = pool_pixels + slot * width * height;
-        int split = (tick * 7) % width;
+        int split = (tick * 7 + lane * 31) % width;
         for (int x = 0; x < width; ++x)
             pixels[x] = htole32(x < split ? 0xffff0000u : 0xff0000ffu);
         for (int y = 1; y < height; ++y) memcpy(pixels + y * width, pixels, STRIDE);
@@ -545,6 +547,7 @@ int main(int argc, char **argv) {
     animate = mode && !strcmp(mode, "1");
     if (animate) {
         width = 640; height = 360;
+        lane = setting("M2_INSTANCE", 1, 8) - 1;
         slots = setting("M2_SLOTS", 1, MAX_SLOTS);
         ticks = FPS * setting("M2_SECONDS", 3, 30);
     }

@@ -1,4 +1,4 @@
-# M2：跨 VM SHM 单窗验收
+# M2：跨 VM SHM 窗口验收
 
 Linux Wayland SHM → ext4 DAX / `virtio-pmem` → macOS AppKit。本机：Intel i9-9980HK、macOS 14.8.9、QEMU 11.1.3/HVF、Zig 0.16.0。
 
@@ -7,8 +7,9 @@ Linux Wayland SHM → ext4 DAX / `virtio-pmem` → macOS AppKit。本机：Intel
 | 默认单帧 | 64×48 四色图案，12,288 字节全量校验；`DAX_FRAME_OK`、`WINDOW_OK` |
 | [Weston](#真实客户端weston-simple-shm) | 12 张 250×250 帧、3 张不同内容、协议关闭成功；`WESTON_OK` |
 | [动画](#动画基准) | 优化构建下 58.33–58.67 次提交/s；通知到图层提交 p95 约 4.3 ms |
+| [单 VM 多窗](#单-vm-多窗) | 8 窗平均 58.75 次提交/s，较单窗下降约 1.4%；`MULTI_OK` |
 
-三种模式均输出 `CLEANUP_OK` 和 `SCLEREID_M2_OK`：来宾 socket 移除、VM 退出、帧端口 EOF 后宿主窗口关闭。
+上述三种单窗模式均输出 `CLEANUP_OK` 和 `SCLEREID_M2_OK`：来宾 socket 移除、VM 退出、帧端口 EOF 后宿主窗口关闭。
 
 ## 复现
 
@@ -29,7 +30,7 @@ python3 docs/sclereid/m2/sclereid-m2.py "$iso" --animate
 
 `--weston` 从 `weston-clients-14.0.2-r1.apk` 运行原版 `weston-simple-shm`，不启动 Weston 合成器；使用 `--apks DIR` 时将这个 APK 一并放入缓存。桥实现 `xdg-shell` v1 单窗流程：空提交触发 configure，匹配的 `ack_configure` 后接收 SHM，按帧回调节流，收到回执才复用槽位。脚本检查帧序和非空不透明内容，通过内容摘要确认画面变化，最后请求 `xdg_toplevel.close` 并检查退出。
 
-下一步：原生关闭按钮、resize、缩放、输入、多窗和异常断链，再跑 GTK/Qt 和 Electron。
+下一步：原生关闭按钮、resize、缩放、输入、多窗协议兼容和异常断链，再跑 GTK/Qt 和 Electron。
 
 ## 动画基准
 
@@ -62,3 +63,22 @@ done
 | 4 | 599 | 0 | 1 | 5 | 4 | 20.600 |
 
 `过期`：来宾到达检查点（含填充阶段）时已过下一节拍；`无空槽`：节拍有效但槽位均未归还；`迟交`：来宾在下一节拍后才处理已提交帧的 Wayland buffer release，不计作跳过。
+
+## 单 VM 多窗
+
+**本机多窗性能基本满足当前使用要求。** 同一台持续运行的 Alpine/HVF VM 内并发 1、2、4、8 个客户端。每客户端有独立 Wayland 桥、DAX 槽和 AppKit 窗口进程，共用 QEMU。640×360 动画、每窗双槽、目标 60 Hz，每档测 10 秒。
+
+| 同一 VM 内的窗口数 | 每窗平均提交 FPS | 宿主进程合计 CPU | 合计 RSS 中位数 / 采样峰值（MiB） | QEMU RSS 中位数（MiB） |
+|---:|---:|---:|---:|---:|
+| 1 | 59.60 | 41.5% | 932.1 / 932.1 | 778.8 |
+| 2 | 59.55 | 67.2% | 979.1 / 984.0 | 781.6 |
+| 4 | 59.35 | 117.3% | 1077.7 / 1087.0 | 791.6 |
+| 8 | 58.75 | 219.9% | 1310.2 / 1350.4 | 812.0 |
+
+8 窗时最慢一窗 58.3 FPS，平均较单窗下降约 1.4%。合计 RSS 中位数增加约 378 MiB，其中 AppKit 约 296 MiB、QEMU 约 33 MiB。各窗通过像素、帧序、槽位和回收检查，整组输出 `MULTI_OK`。
+
+FPS 为图层提交率。CPU 以一个逻辑核为 100%；合计为 QEMU、Python 和 AppKit 进程之和，RSS 未对共享页去重。WindowServer 单列，1/2/4/8 窗 CPU 分别为 22.8% / 26.8% / 34.6% / 53.6%。
+
+```sh
+python3 docs/sclereid/m2/sclereid-m2-scale.py "$iso" --instances 1 2 4 8 --seconds 10 --slots 2
+```

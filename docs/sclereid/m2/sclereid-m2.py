@@ -117,7 +117,7 @@ def extract(region):
     return frame
 
 
-def play_animation(port, stream, region, window, report, slots, seconds):
+def play_animation(port, stream, region, window, report, slots, seconds, lane=0):
     last_tick = -1
     start = None
     previous = None
@@ -138,7 +138,7 @@ def play_animation(port, stream, region, window, report, slots, seconds):
         if not (last_tick < tick < seconds * 60 and slot < slots):
             raise ValueError(f'out-of-range animation frame: {line!r}')
         last_tick = tick
-        marker = MARKER[:-1] + bytes([MARKER[-1] + slot])
+        marker = MARKER[:-1] + bytes([MARKER[-1] + 4 * lane + slot])
         if slot not in offsets:
             offset = region.find(marker)
             end = offset + len(marker) + size
@@ -152,7 +152,7 @@ def play_animation(port, stream, region, window, report, slots, seconds):
             raise ValueError('animation region marker changed')
         base = offset + len(MARKER)
         frame = region[base:base + size]
-        split = tick * 7 % 640
+        split = (tick * 7 + lane * 31) % 640
         row = red * split + blue * (640 - split)
         tag = (0xff000000 | tick).to_bytes(4, 'little') + (0xff000000 | slot).to_bytes(4, 'little')
         if frame != tag + row[8:] + row * 359:
@@ -230,7 +230,7 @@ def play_weston(port, stream, region, window, report):
     print(f'WESTON_OK: 12 frames, {len(frames)} distinct, xdg_toplevel.close completed', flush=True)
 
 
-def run(work, iso, animate, slots, seconds, weston):
+def vm_command(work, iso, ports=1):
     for kind in ('vmlinuz', 'initramfs'):
         with (work / kind).open('wb') as out:
             sp.run(['bsdtar', '-xOf', iso, f'boot/{kind}-lts'], stdout=out, check=True)
@@ -241,9 +241,16 @@ def run(work, iso, animate, slots, seconds, weston):
            'console=ttyS0,115200 modules=loop,squashfs,sd-mod,sr-mod',
            '-object', 'memory-backend-file,id=r,size=32M,mem-path=region,share=on',
            '-device', 'virtio-pmem-pci,memdev=r', '-device', 'virtio-serial-pci,id=v',
-           '-chardev', 'socket,id=f,path=./frames,server=on,wait=off',
-           '-device', 'virtserialport,bus=v.0,nr=1,chardev=f,name=frames',
            '-fw_cfg', 'name=opt/sclereid/m2,file=guest.tar']
+    for i in range(ports):
+        name = 'frames' if not i else f'frames{i}'
+        cmd.extend(['-chardev', f'socket,id=f{i},path=./{name},server=on,wait=off',
+                    '-device', f'virtserialport,bus=v.0,nr={i+1},chardev=f{i},name={name}'])
+    return cmd
+
+
+def run(work, iso, animate, slots, seconds, weston):
+    cmd = vm_command(work, iso)
     with (work / 'region').open('xb+') as file:
         file.truncate(REGION_BYTES)
         with mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as region, child(cmd, work) as vm:
@@ -265,6 +272,7 @@ def run(work, iso, animate, slots, seconds, weston):
                     b'tar -xf /sys/firmware/qemu_fw_cfg/by_name/opt/sclereid/m2/raw -C /tmp/bridge && '
                     b'echo GUEST_READY\n')
                 console.until(b'GUEST_READY\r\n', 60)
+
                 client = b'/tmp/bridge/weston-simple-shm' if weston else b'/tmp/bridge/bridge client'
                 vm.stdin.write(
                     b'(export XDG_RUNTIME_DIR=/tmp/m2 WAYLAND_DISPLAY=m2 LD_LIBRARY_PATH=/tmp/bridge; '
