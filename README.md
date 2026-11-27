@@ -405,9 +405,22 @@ Ubuntu / Debian 内置：
 
 Arch 使用 `pacman` 安装 `noto-fonts-cjk`、`gtk3/gtk4`、`nss`、`mesa` 等；Alpine 使用 `apk` 安装 `font-noto-cjk`、`gtk+3.0`、`mesa` 等，并设置 `LANG=C.UTF-8`（musl 不依赖 glibc locale）。
 
-Container 以 `--shm-size=2g` 启动，避免 Chromium 因 `/dev/shm` 过小崩溃。Electron 应用启动时自动追加 `--no-sandbox --disable-gpu`，并在「设置 → 图形性能」开启「解除 Electron 应用帧率限制」后追加 `--disable-frame-rate-limit --disable-gpu-vsync`（默认开启）。Alpine 上的官方 Electron 构建兼容性有限，预设会避免提供这类应用。
+Container 以 `--shm-size=2g` 启动，避免 Chromium 因 `/dev/shm` 过小崩溃。Electron 应用启动时自动追加 `--no-sandbox --disable-gpu`（实验性 GPU 开关会改为 GPU 参数）。Alpine 上的官方 Electron 构建兼容性有限，预设会避免提供这类应用。
 
-> **为什么需要解除帧率限制**：XQuartz 在窗口（rootless）模式下把屏幕刷新率报告为 1 Hz。Chromium 会读取该值作为合成器的帧预算，于是 VS Code、Chrome、Slack 等 Electron 应用被限流到约 1–2 fps，表现为严重卡顿。`--disable-frame-rate-limit` 移除该上限后，界面可正常流畅刷新。该参数只在实际动画/滚动时占用 CPU，静止页面几乎不耗电；若希望回到旧行为，可在设置中关闭此开关（需重新封装已生成的 `.app` 才会生效）。
+### 8.4.1 Rootless 刷新率
+
+XQuartz 的 rootless 模式在源码里把 XRandR 刷新率硬编码为 1 Hz（`FAKE_REFRESH_ROOTLESS`），Chromium / Electron 会据此把合成器限流到约 1–2 fps。XQuartz 没有可修改此值的偏好设置，修改 XQuartz 本身也不符合 Graft 不捆绑/不修改依赖的原则。
+
+Graft 的解决办法是随包附带一个很小的 Linux XRandR shim（源码与预编译的 glibc/musl、x86_64/arm64 `.so` 在 `Resources/Shims`）。启动 Linux 应用前，Graft 把 shim 复制到容器并设置：
+
+```text
+LD_PRELOAD=/usr/local/lib/libgraft-xrandr-refresh.so
+GRAFT_MAX_REFRESH=<目标 Hz>
+```
+
+shim 同时拦截 Xlib 与 XCB 的 XRandR 响应，只改写客户端看到的刷新率，不修改 XQuartz。Chromium 因此按所选上限（默认匹配 macOS，例如 60/120 Hz）合成，而不是 1 Hz 或无限帧率。
+
+「设置 → 图形性能 → 最大刷新率」可选：匹配 macOS、30、60、120 Hz、不限制（旧行为）。已封装 `.app` 的启动脚本会在下次启动 Graft 时自动升级；正在运行的 Linux 应用需重启，旧 `.app` 若未升级则重新封装。若 shim 无法加载，Graft 会回退到旧的 `--disable-frame-rate-limit` 行为。
 
 ### 8.5 宿主目录
 
@@ -447,7 +460,7 @@ Container 以 `--shm-size=2g` 启动，避免 Chromium 因 `/dev/shm` 过小崩�
 | 启动应用时 XQuartz 总是跳到前台 / 出现在 Dock | 新 launcher 使用 `open -g` 后台启动 XQuartz，不再抢焦点；如需完全隐藏 Dock/Cmd-Tab，设置里点击「隐藏图标」（修改 Info.plist，自动备份，需要管理员）。 |
 | 中文显示为方块 | 确认镜像构建包含 Noto CJK 字体（`fonts-noto-cjk` / `noto-fonts-cjk` / `font-noto-cjk`）；重新构建基础镜像 |
 | Electron 应用闪退 | 确认容器以 `--shm-size=2g` 启动；日志中检查 `--no-sandbox` |
-| Electron 应用（VS Code / Chrome / Slack）卡顿、画面每秒只刷新一两次 | XQuartz 窗口模式报告 1 Hz 刷新率，Chromium 据此限流。请在「设置 → 图形性能」确认「解除 Electron 应用帧率限制」为开启，并重新封装该应用（旧 `.app` 不含新参数）。 |
+| Electron 应用（VS Code / Chrome / Slack）卡顿、画面每秒只刷新一两次 | XQuartz rootless 模式报告 1 Hz 刷新率。新版 Graft 会通过 XRandR shim 向应用报告 macOS 刷新率；确认「设置 → 图形性能 → 最大刷新率」不是「不限制」以外的异常值，并重启应用。旧封装会在下次启动 Graft 时自动升级启动脚本。 |
 | 图标是占位图 | 该应用可能只有 `.xpm` 图标；安装 `librsvg` 或手动替换 `.icns` |
 | 生成的应用打不开 | 查看 `~/Library/Application Support/Graft/logs/<id>.log` |
 
@@ -494,7 +507,7 @@ make uninstall PURGE=1       # 同时删除 ~/Library/Application Support/Graft 
 
 ```bash
 swift build          # 编译全部 target
-swift test           # 47 个单元测试
+swift test           # 73 个单元测试
 swift run Graft      # 调试运行
 ```
 

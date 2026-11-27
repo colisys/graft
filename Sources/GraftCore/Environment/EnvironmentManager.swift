@@ -16,6 +16,7 @@ public final class EnvironmentManager: ObservableObject {
     public static let colimaMemoryDefaultsKey = "graft.colimaMemoryGB"
     public static let electronGPUDefaultsKey = "graft.electronGPU"
     public static let electronFrameRateUnlockDefaultsKey = "graft.electronFrameRateUnlock"
+    public static let maxRefreshRateModeDefaultsKey = "graft.maxRefreshRateMode"
     public static let xquartzIGLXDefaultsKey = "graft.xquartzIGLX"
     public static let displayScaleDefaultsKey = "graft.displayScale"
     public static let autoSuspendDefaultsKey = "graft.autoSuspend"
@@ -30,6 +31,7 @@ public final class EnvironmentManager: ObservableObject {
     @Published public private(set) var colimaState: ColimaState = .unknown
     @Published public private(set) var containerState: ContainerRuntimeState = .unavailable
     @Published public private(set) var xquartzRunning = false
+    @Published public private(set) var detectedRefreshRate = DisplayRefreshRate.current()
     @Published public private(set) var stats = RuntimeStats()
     @Published public private(set) var activityMessage: String?
     @Published public private(set) var lastError: String?
@@ -51,6 +53,7 @@ public final class EnvironmentManager: ObservableObject {
             )
             containerState = .unavailable
             stats = RuntimeStats()
+            applyMaxRefreshRate()
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 await self.refreshContainerState()
@@ -130,6 +133,35 @@ public final class EnvironmentManager: ObservableObject {
             )
             runtimeSettings.electronFrameRateUnlockEnabled = electronFrameRateUnlockEnabled
         }
+    }
+
+    /// Maximum refresh rate presented to Linux/X11 applications. Rootless
+    /// XQuartz otherwise reports a hard-coded 1 Hz mode.
+    @Published public var maxRefreshRateMode: MaxRefreshRateMode {
+        didSet {
+            UserDefaults.standard.set(
+                maxRefreshRateMode.rawValue,
+                forKey: Self.maxRefreshRateModeDefaultsKey
+            )
+            applyMaxRefreshRate()
+        }
+    }
+
+    /// Effective shim cap for a base image. Zero means no shim (fallback to
+    /// the legacy unlimited Electron flags).
+    public func maxRefreshRate(for base: BaseImage) -> Int {
+        guard let hz = maxRefreshRateMode.resolvedHz(detected: detectedRefreshRate),
+              XRandRShim.isAvailable(for: base) else {
+            return 0
+        }
+        return hz
+    }
+
+    private func applyMaxRefreshRate() {
+        let hz = maxRefreshRate(for: baseImage)
+        runtimeSettings.maxRefreshRate = hz
+        runtimeSettings.electronFrameRateUnlockEnabled =
+            maxRefreshRateMode == .unlimited || hz == 0
     }
 
     /// XQuartz indirect GLX. Only affects OpenGL applications; restart XQuartz.
@@ -238,9 +270,11 @@ public final class EnvironmentManager: ObservableObject {
 
         // Defaults to on: the 1 Hz XQuartz throttle affects every Electron app.
         // A stored value wins so users who explicitly turned it off keep it off.
-        let frameUnlock = UserDefaults.standard.object(forKey: Self.electronFrameRateUnlockDefaultsKey) == nil
-            ? true
-            : UserDefaults.standard.bool(forKey: Self.electronFrameRateUnlockDefaultsKey)
+        let storedRefreshMode = UserDefaults.standard.string(forKey: Self.maxRefreshRateModeDefaultsKey)
+        let refreshMode = storedRefreshMode.flatMap(MaxRefreshRateMode.init(rawValue:)) ?? .matchDisplay
+        self.maxRefreshRateMode = refreshMode
+        self.detectedRefreshRate = DisplayRefreshRate.current()
+        let frameUnlock = refreshMode == .unlimited
         self.electronFrameRateUnlockEnabled = frameUnlock
         runtimeSettings.electronFrameRateUnlockEnabled = frameUnlock
 
@@ -262,6 +296,8 @@ public final class EnvironmentManager: ObservableObject {
         let located = Self.locateTools()
         self.tools = located
         toolbox.tools = located
+        XRandRShim.installBundledShims()
+        applyMaxRefreshRate()
         startIdleMonitor()
     }
 
@@ -343,6 +379,8 @@ public final class EnvironmentManager: ObservableObject {
         toolbox.tools = located
         runtimeSettings.baseImage = baseImage
         runtimeSettings.environmentName = environmentName
+        detectedRefreshRate = DisplayRefreshRate.current()
+        applyMaxRefreshRate()
         xquartzRunning = await isXQuartzRunning()
         await refreshXQuartzDockIconHidden()
         await refreshColimaState()

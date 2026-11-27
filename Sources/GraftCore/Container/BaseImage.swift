@@ -259,6 +259,7 @@ public final class RuntimeSettings: @unchecked Sendable {
     private var mirrorStorage: String = ""
     private var electronGPUStorage = false
     private var electronFrameRateUnlockStorage = false
+    private var maxRefreshRateStorage = 0
     private var xquartzIGLXStorage = false
     private var displayScaleStorage = 1
 
@@ -332,12 +333,28 @@ public final class RuntimeSettings: @unchecked Sendable {
         }
     }
 
-    /// Adds `--disable-frame-rate-limit` to Electron apps.
+    /// Target refresh rate presented to X11 clients by the XRandR shim.
+    /// Zero disables the shim (legacy unlimited behavior).
+    public var maxRefreshRate: Int {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return maxRefreshRateStorage
+        }
+        set {
+            lock.lock()
+            maxRefreshRateStorage = max(0, newValue)
+            lock.unlock()
+        }
+    }
+
+    /// Legacy fallback: adds `--disable-frame-rate-limit` to Electron apps.
     ///
     /// Rootless XQuartz advertises a 1 Hz screen, and Chromium derives its
     /// compositor frame budget from that value, throttling every Chromium /
-    /// Electron app to ~1 fps. This switch removes that limit. It only costs
-    /// CPU while the app is actually animating; static pages stay near idle.
+    /// Electron app to ~1 fps. The XRandR shim fixes that for new wrappers;
+    /// this switch remains for unlimited mode and for hosts where the shim
+    /// cannot be loaded.
     public var electronFrameRateUnlockEnabled: Bool {
         get {
             lock.lock()

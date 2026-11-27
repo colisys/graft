@@ -19,6 +19,9 @@ public struct LauncherConfiguration: Sendable {
     public var logDirectory: String
     public var baseImage: BaseImage
     public var presetID: String?
+    public var xrandrShimPath: String?
+    public var maxRefreshRate: Int
+    public var autoMaxRefreshRate: Bool
 
     public init(
         tools: ToolLocations,
@@ -32,7 +35,10 @@ public struct LauncherConfiguration: Sendable {
         sessionDirectory: String,
         logDirectory: String,
         baseImage: BaseImage = .ubuntu,
-        presetID: String? = nil
+        presetID: String? = nil,
+        xrandrShimPath: String? = nil,
+        maxRefreshRate: Int = 0,
+        autoMaxRefreshRate: Bool = false
     ) {
         self.tools = tools
         self.colimaStartArguments = colimaStartArguments
@@ -46,6 +52,9 @@ public struct LauncherConfiguration: Sendable {
         self.logDirectory = logDirectory
         self.baseImage = baseImage
         self.presetID = presetID
+        self.xrandrShimPath = xrandrShimPath
+        self.maxRefreshRate = max(0, maxRefreshRate)
+        self.autoMaxRefreshRate = autoMaxRefreshRate
     }
 }
 
@@ -66,6 +75,9 @@ public enum LauncherScriptBuilder {
         let startArguments = ShellQuote.join(configuration.colimaStartArguments)
         let runArguments = ShellQuote.join(configuration.containerRunArguments)
         let launchArguments = ShellQuote.join(configuration.launchTokens)
+        let shimPath = configuration.xrandrShimPath ?? ""
+        let maxRefreshRate = max(0, configuration.maxRefreshRate)
+        let autoMaxRefreshRate = configuration.autoMaxRefreshRate ? "1" : "0"
         // The container-side command records its own PID before replacing
         // itself with the app, so the host can kill it when the .app exits.
         let innerLaunch = "echo $$ > \"$GRAFT_PID_FILE\"; exec \(launchArguments)"
@@ -90,6 +102,11 @@ public enum LauncherScriptBuilder {
         LOG_DIR=\(quote(configuration.logDirectory))
         APP_PID_FILE="/tmp/graft-session-\(sessionID)-$$.pid"
         ORIG_PPID=$PPID
+        MAX_REFRESH=\(maxRefreshRate)
+        AUTO_MAX_REFRESH=\(autoMaxRefreshRate)
+        XRANDR_SHIM=\(quote(shimPath))
+        XRANDR_SHIM_DEST=\(quote(XRandRShim.containerPath))
+        PRELOAD_ENV=""
 
         mkdir -p "$LOG_DIR" "$SESSION_DIR"
         LOG_FILE="$LOG_DIR/$SESSION_ID.log"
@@ -160,13 +177,26 @@ public enum LauncherScriptBuilder {
 
         [ "$state" = "true" ] || { echo "ERROR: container did not become ready: $CONTAINER"; exit 1; }
 
+        # 3b. Present the macOS refresh rate to X11 clients. XQuartz rootless
+        #     mode hard-codes a 1 Hz fake mode; the shim rewrites XRandR replies.
+        if [ "$AUTO_MAX_REFRESH" = "1" ]; then
+          MAX_REFRESH="${GRAFT_MAX_REFRESH:-$MAX_REFRESH}"
+        fi
+        if [ -n "$XRANDR_SHIM" ] && [ -f "$XRANDR_SHIM" ] && [ "$MAX_REFRESH" -gt 0 ] 2>/dev/null; then
+          if "$DOCKER" cp "$XRANDR_SHIM" "$CONTAINER:$XRANDR_SHIM_DEST" >/dev/null 2>&1; then
+            PRELOAD_ENV="-e LD_PRELOAD=$XRANDR_SHIM_DEST -e GRAFT_MAX_REFRESH=$MAX_REFRESH"
+          else
+            echo "WARNING: could not install XRandR refresh shim"
+          fi
+        fi
+
         # 4. Mark the session and run the app in the foreground so this .app
         #    stays alive exactly as long as the Linux process does.
         printf '%s\\t%s\\t%s\\t%s\\t%s\\n' "$$" "$(date +%s)" "$NAME" "$CONTAINER" "$APP_PID_FILE" > "$SESSION_FILE"
         marker_written=1
 
         echo "Launching inside container..."
-        "$DOCKER" exec -u graft -e GRAFT_PID_FILE="$APP_PID_FILE" -e DISPLAY="$DISPLAY_HOST" -e HOME=/home/graft -e XDG_RUNTIME_DIR=/tmp/runtime-graft "$CONTAINER" sh -c \(quote(innerLaunch)) &
+        "$DOCKER" exec -u graft -e GRAFT_PID_FILE="$APP_PID_FILE" -e DISPLAY="$DISPLAY_HOST" -e HOME=/home/graft -e XDG_RUNTIME_DIR=/tmp/runtime-graft $PRELOAD_ENV "$CONTAINER" sh -c \(quote(innerLaunch)) &
         exec_pid=$!
         while kill -0 "$exec_pid" 2>/dev/null; do
           if [ "$PPID" != "$ORIG_PPID" ] || ! kill -0 "$ORIG_PPID" 2>/dev/null; then

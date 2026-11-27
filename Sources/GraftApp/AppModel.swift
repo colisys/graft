@@ -61,6 +61,7 @@ final class AppModel: ObservableObject {
         self.environment = EnvironmentManager(log: logStore)
         self.orchestrator = ContainerOrchestrator(log: logStore)
         self.wrapperGenerator = AppWrapperGenerator(log: logStore)
+        XRandRShim.installBundledShims()
         self.wrappedApps = Self.scanWrappedApps()
         self.installations = InstallationRegistry.shared.all()
 
@@ -519,7 +520,10 @@ final class AppModel: ObservableObject {
         settings.environmentName = environment.environmentName
         settings.registryMirror = environment.dockerRegistryMirror
         settings.electronGPUEnabled = environment.electronGPUEnabled
-        settings.electronFrameRateUnlockEnabled = environment.electronFrameRateUnlockEnabled
+        let maxRefreshRate = environment.maxRefreshRate(for: base)
+        settings.maxRefreshRate = maxRefreshRate
+        settings.electronFrameRateUnlockEnabled =
+            environment.maxRefreshRateMode == .unlimited || maxRefreshRate == 0
         settings.xquartzIGLXEnabled = environment.xquartzIGLXEnabled
         settings.displayScale = environment.displayScale
         return ContainerOrchestrator(
@@ -540,7 +544,10 @@ final class AppModel: ObservableObject {
             : ""
         settings.registryMirror = environment.dockerRegistryMirror
         settings.electronGPUEnabled = environment.electronGPUEnabled
-        settings.electronFrameRateUnlockEnabled = environment.electronFrameRateUnlockEnabled
+        let maxRefreshRate = environment.maxRefreshRate(for: base)
+        settings.maxRefreshRate = maxRefreshRate
+        settings.electronFrameRateUnlockEnabled =
+            environment.maxRefreshRateMode == .unlimited || maxRefreshRate == 0
         settings.xquartzIGLXEnabled = environment.xquartzIGLXEnabled
         settings.displayScale = environment.displayScale
         return ContainerOrchestrator(
@@ -621,7 +628,10 @@ final class AppModel: ObservableObject {
         settings.baseImage = base
         settings.environmentName = name
         settings.registryMirror = environment.dockerRegistryMirror
-        settings.electronFrameRateUnlockEnabled = environment.electronFrameRateUnlockEnabled
+        let maxRefreshRate = environment.maxRefreshRate(for: base)
+        settings.maxRefreshRate = maxRefreshRate
+        settings.electronFrameRateUnlockEnabled =
+            environment.maxRefreshRateMode == .unlimited || maxRefreshRate == 0
         let target = ContainerOrchestrator(log: log, runtimeSettings: settings)
         guard !containers.contains(where: { $0.name == target.containerName }) else {
             present(GraftError.installFailed("环境 \(name) 已存在。"))
@@ -885,19 +895,29 @@ final class AppModel: ObservableObject {
         presetID: String?,
         target: ContainerOrchestrator
     ) -> LauncherConfiguration {
-        LauncherConfiguration(
+        let shim = XRandRShim.hostURL(for: base)
+        let maxRefreshRate = environment.maxRefreshRate(for: base)
+        let autoMaxRefreshRate =
+            environment.maxRefreshRateMode == .matchDisplay && maxRefreshRate > 0
+        return LauncherConfiguration(
             tools: environment.tools,
             colimaStartArguments: environment.colimaStartArguments,
             containerRunArguments: target.containerRunArguments(),
             containerName: target.containerName,
             display: GraftConstants.display,
-            launchTokens: target.applicationTokens(for: entry),
+            launchTokens: target.applicationTokens(
+                for: entry,
+                includeRefreshEnvironment: false
+            ),
             processName: entry.executableToken,
             xquartzAppPath: environment.tools.xquartzApp?.path,
             sessionDirectory: SessionRegistry.sessionsDirectory.path,
             logDirectory: SessionRegistry.logsDirectory.path,
             baseImage: base,
-            presetID: presetID
+            presetID: presetID,
+            xrandrShimPath: shim?.path,
+            maxRefreshRate: maxRefreshRate,
+            autoMaxRefreshRate: autoMaxRefreshRate
         )
     }
 

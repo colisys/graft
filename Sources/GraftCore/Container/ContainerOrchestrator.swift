@@ -328,6 +328,37 @@ public final class ContainerOrchestrator: @unchecked Sendable {
         try await ensureDockerDaemon()
         try await ensureImage(progress: progress)
         try await ensureContainer(progress: progress)
+        await ensureXRandRShim(progress: progress)
+    }
+
+    /// Copies the small XRandR refresh shim into the container. The wrapper
+    /// launcher does the same for .app launches, where Graft is not running.
+    private func ensureXRandRShim(progress: ProgressHandler? = nil) async {
+        guard runtimeSettings.maxRefreshRate > 0,
+              let host = XRandRShim.hostURL(for: baseImage),
+              let docker = toolbox.tools.docker else {
+            return
+        }
+        let check = try? await runner.run(
+            docker,
+            ["exec", "-u", "root", containerName, "test", "-s", XRandRShim.containerPath],
+            options: RunOptions(timeout: 10)
+        )
+        if check?.succeeded == true {
+            return
+        }
+        progress?("正在准备显示刷新率…")
+        let copy = try? await runner.run(
+            docker,
+            ["cp", host.path, "\(containerName):\(XRandRShim.containerPath)"],
+            options: RunOptions(timeout: 30)
+        )
+        if copy?.succeeded != true {
+            log.append(
+                "XRandR 刷新率 shim 复制失败；应用将回退到旧帧率行为。",
+                level: .warning
+            )
+        }
     }
 
     public func ensureContainer(progress: ProgressHandler? = nil) async throws {
@@ -887,7 +918,10 @@ public final class ContainerOrchestrator: @unchecked Sendable {
     }
 
     /// Final argv executed inside the container.
-    public func applicationTokens(for entry: DesktopEntry) -> [String] {
+    public func applicationTokens(
+        for entry: DesktopEntry,
+        includeRefreshEnvironment: Bool = true
+    ) -> [String] {
         var tokens = entry.execTokens
         if tokens.isEmpty {
             tokens = ["/bin/bash", "-lc", entry.exec]
@@ -895,6 +929,10 @@ public final class ContainerOrchestrator: @unchecked Sendable {
         if isFirefox(entry: entry), !tokens.contains("MOZ_DISABLE_CONTENT_SANDBOX=1") {
             tokens = ["env", "MOZ_DISABLE_CONTENT_SANDBOX=1"] + tokens
         }
+        let shimRate = runtimeSettings.maxRefreshRate > 0
+            && XRandRShim.isAvailable(for: baseImage)
+            ? runtimeSettings.maxRefreshRate
+            : 0
         if isElectron(entry: entry) {
             if runtimeSettings.displayScale == 2 && !tokens.contains(where: { $0.hasPrefix("--force-device-scale-factor=") }) {
                 tokens.append("--force-device-scale-factor=2")
@@ -911,29 +949,34 @@ public final class ContainerOrchestrator: @unchecked Sendable {
             } else if !tokens.contains("--disable-gpu") {
                 tokens.append("--disable-gpu")
             }
-            if runtimeSettings.electronFrameRateUnlockEnabled {
-                // Rootless XQuartz reports a 1 Hz screen; Chromium trusts that
-                // value and throttles the compositor to ~1 fps. Removing the
-                // frame-rate limit restores smooth rendering. `--disable-gpu-vsync`
-                // is implied by this switch; adding it explicitly keeps older
-                // Electron/Chromium builds consistent.
+            if shimRate == 0 && runtimeSettings.electronFrameRateUnlockEnabled {
+                // Fallback for hosts where the XRandR shim is unavailable:
+                // remove the 1 Hz limit entirely. This can render faster than
+                // the macOS display, so it is only used when capped mode is
+                // not possible.
                 for flag in ["--disable-frame-rate-limit", "--disable-gpu-vsync"]
                 where !tokens.contains(flag) {
                     tokens.append(flag)
                 }
             }
         }
-        let scale = runtimeSettings.displayScale
-        let scaleEnvironment: [String]
-        if scale == 2 {
-            // Chromium uses its own device-scale factor; avoid applying GTK scaling twice.
-            scaleEnvironment = isElectron(entry: entry)
-                ? ["env", "QT_SCALE_FACTOR=2"]
-                : ["env", "GDK_SCALE=2", "QT_SCALE_FACTOR=2"]
-        } else {
-            scaleEnvironment = []
+
+        var environment: [String] = []
+        if includeRefreshEnvironment && shimRate > 0 {
+            environment.append("LD_PRELOAD=\(XRandRShim.containerPath)")
+            environment.append("GRAFT_MAX_REFRESH=\(shimRate)")
         }
-        return ["dbus-run-session", "--"] + scaleEnvironment + tokens
+        if runtimeSettings.displayScale == 2 {
+            // Chromium uses its own device-scale factor; avoid applying GTK scaling twice.
+            if isElectron(entry: entry) {
+                environment.append("QT_SCALE_FACTOR=2")
+            } else {
+                environment.append("GDK_SCALE=2")
+                environment.append("QT_SCALE_FACTOR=2")
+            }
+        }
+        let envPrefix = environment.isEmpty ? [] : ["env"] + environment
+        return ["dbus-run-session", "--"] + envPrefix + tokens
     }
 
     private func isFirefox(entry: DesktopEntry) -> Bool {

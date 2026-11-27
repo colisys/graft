@@ -27,6 +27,11 @@ final class LauncherDelegate: NSObject, NSApplicationDelegate {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [scriptURL.path]
+        var environment = ProcessInfo.processInfo.environment
+        if let screen = NSScreen.main, screen.maximumFramesPerSecond > 0 {
+            environment["GRAFT_MAX_REFRESH"] = String(screen.maximumFramesPerSecond)
+        }
+        process.environment = environment
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice

@@ -35,7 +35,7 @@ struct SettingsView: View {
         .onChange(of: environment.colimaCPU) { _ in model.notifySettingChanged("Colima CPU") }
         .onChange(of: environment.colimaMemoryGB) { _ in model.notifySettingChanged("Colima 内存") }
         .onChange(of: environment.electronGPUEnabled) { _ in model.notifySettingChanged("GPU 合成设置") }
-        .onChange(of: environment.electronFrameRateUnlockEnabled) { _ in model.notifySettingChanged("帧率限制") }
+        .onChange(of: environment.maxRefreshRateMode) { _ in model.notifySettingChanged("最大刷新率") }
         .onChange(of: environment.displayScale) { _ in model.notifySettingChanged("Linux 应用缩放") }
         .onChange(of: environment.xquartzIGLXEnabled) { _ in model.notifySettingChanged("XQuartz GLX 设置") }
         .onChange(of: environment.dockerRegistryMirror) { _ in model.notifySettingChanged("镜像源") }
@@ -311,13 +311,18 @@ struct SettingsView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            Toggle(
-                "解除 Electron 应用帧率限制（修复卡顿）",
-                isOn: $environment.electronFrameRateUnlockEnabled
-            )
+            Picker("最大刷新率", selection: $environment.maxRefreshRateMode) {
+                Text("匹配 macOS（\(environment.detectedRefreshRate) Hz）")
+                    .tag(MaxRefreshRateMode.matchDisplay)
+                Text("30 Hz").tag(MaxRefreshRateMode.hz30)
+                Text("60 Hz").tag(MaxRefreshRateMode.hz60)
+                Text("120 Hz").tag(MaxRefreshRateMode.hz120)
+                Text("不限制（旧行为）").tag(MaxRefreshRateMode.unlimited)
+            }
+            .pickerStyle(.menu)
             .disabled(model.isBusy || model.isActionPending)
 
-            Text("XQuartz 在窗口模式下把屏幕刷新率报告为 1 Hz，Chromium / Electron 应用（VS Code、Chrome、Slack 等）会据此把界面卡在约 1–2 fps，表现为严重卡顿。开启后 Graft 为 Electron 应用追加 --disable-frame-rate-limit，界面即可流畅刷新；仅在实际动画/滚动时占用 CPU，空闲时几乎不耗电。已封装的应用需重新封装才会生效。")
+            Text("XQuartz 的 rootless 模式把 XRandR 刷新率硬编码为 1 Hz，Chromium / Electron 会据此把界面限到约 1–2 fps。Graft 随包提供一个小型 Linux XRandR shim（源码在 Resources/Shims），只改写 X11 客户端看到的刷新率，不修改 XQuartz；应用会按此上限合成画面，既能正常刷新，又不会无限渲染。选择「不限制」才会使用旧的 --disable-frame-rate-limit。已封装的 .app 会在下次启动 Graft 时自动升级启动脚本；运行中的应用需重启。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

@@ -42,6 +42,16 @@ cp "$BIN_PATH/Graft" "$STAGE/Contents/MacOS/Graft"
 cp "$ROOT/Resources/Info.plist" "$STAGE/Contents/Info.plist"
 cp "$ROOT/LICENSE" "$STAGE/Contents/Resources/LICENSE"
 
+# Linux XRandR refresh shim (Graft-owned, GPL). Rootless XQuartz reports a
+# hard-coded 1 Hz mode; the shim presents the selected macOS refresh rate to
+# X11 clients inside the container.
+mkdir -p "$STAGE/Contents/Resources/Shims"
+if compgen -G "$ROOT/Resources/Shims/*.so" >/dev/null; then
+    cp "$ROOT/Resources/Shims/"*.so "$STAGE/Contents/Resources/Shims/"
+else
+    echo "warning: no XRandR shim binaries found; capped refresh rate will fall back." >&2
+fi
+
 # Native launcher embedded into generated .app wrappers. It makes LaunchServices
 # see a real AppKit executable instead of a shell script, so the Dock icon
 # stops bouncing after the app finishes launching.
