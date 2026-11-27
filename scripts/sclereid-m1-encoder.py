@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Software H.264 and AV1 batch benchmark with optional Alpine/HVF guest. Requires FFmpeg with libx264."""
+"""Software H.264 live and H.264/AV1 batch benchmark with optional Alpine/HVF guest. Requires FFmpeg with libx264."""
 import argparse
+import base64
 from contextlib import ExitStack
 import secrets
 import hashlib
@@ -11,9 +12,11 @@ import re
 import selectors
 import shlex
 import shutil
+import socket
 import statistics
 import subprocess
 import tempfile
+import threading
 import time
 
 WIDTH, HEIGHT, FPS, FRAMES = 1920, 1080, 60, 120
@@ -42,7 +45,7 @@ def sha(path):
 
 
 class Guest:
-    def __init__(self, stack, work, iso, binary, svt=None):
+    def __init__(self, stack, work, iso, binary, svt=None, live_port=None):
         if sha(iso) != ISO_SHA:
             raise ValueError('expected pinned Alpine standard 3.22.2 x86_64 ISO')
         for name in ('vmlinuz-lts', 'initramfs-lts'):
@@ -54,7 +57,8 @@ class Guest:
         self.region = stack.enter_context(mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ))
         self.vm = subprocess.Popen([
             'qemu-system-x86_64', '-machine', 'q35,accel=hvf', '-cpu', 'host',
-            '-smp', '2', '-m', '3072M,slots=1,maxmem=4G' if svt else '1024M,slots=1,maxmem=2G', '-nic', 'none',
+            '-smp', '2', '-m', '3072M,slots=1,maxmem=4G' if svt else '1024M,slots=1,maxmem=2G', *(['-netdev', f'user,id=n,restrict=on,ipv6=off,hostfwd=tcp:127.0.0.1:{live_port}-10.0.2.15:9000',
+               '-device', 'virtio-net-pci,netdev=n'] if live_port else ['-nic', 'none']),
             '-display', 'none', '-monitor', 'none', '-serial', 'stdio', '-no-reboot',
             '-kernel', 'vmlinuz-lts', '-initrd', 'initramfs-lts', '-cdrom', str(iso),
             '-append', 'console=ttyS0,115200 modules=loop,squashfs,sd-mod,sr-mod',
@@ -76,6 +80,9 @@ class Guest:
                            '&& mkdir /bench && mount -t tmpfs -o size=512m tmpfs /bench '
                            '&& cd /bench && cp /dev/vda ffmpeg && chmod +x ffmpeg '
                            '&& ./ffmpeg -version'), flush=True)
+
+        if live_port:
+            self.command('modprobe virtio_net && ip link set eth0 up && ip addr add 10.0.2.15/24 dev eth0')
 
         if svt:
             self.command('tar xf /dev/vdb && LD_LIBRARY_PATH=./usr/lib ./usr/bin/SvtAv1EncApp --version')
@@ -119,6 +126,117 @@ class Guest:
         if not payload.startswith(nonce.encode()) or hashlib.sha256(payload).hexdigest() != digest:
             raise ValueError('stale or corrupt pmem payload')
         (work / 'clip.bin').write_bytes(payload[len(nonce):])
+
+
+def live_h264(ffmpeg, repeats, work, guest, port, clips):
+    decode = [ffmpeg, '-nostdin', '-loglevel', 'error', '-xerror', '-threads', '1',
+              '-nofind_stream_info', '-f', 'nut', '-i', 'pipe:0',
+              '-map', '0:v:0', '-fps_mode', 'passthrough', '-enc_time_base', f'1:{FPS}', '-c:v', 'rawvideo', '-threads', '1', '-flush_packets', '1',
+              '-f', 'framecrc', 'pipe:1']
+
+    def connect():
+        end = time.monotonic() + 10
+        while time.monotonic() < end:
+            try:
+                with socket.create_connection(('127.0.0.1', port), timeout=2) as sock:
+                    if sock.recv(1) == b'!':
+                        return sock.dup()
+            except OSError:
+                pass
+            time.sleep(0.02)
+        raise TimeoutError('guest encoder listener did not send readiness marker')
+
+    def percentiles(values):
+        ordered = sorted(values)
+        return '/'.join(f'{ordered[(len(ordered) * p + 99) // 100 - 1]:.2f}' for p in (50, 95, 99, 100))
+
+    print(f'LIVE H264 | {"ALPINE HVF / VIRTIO-NET TCP" if guest else "HOST PIPE"} | '
+          f'{SIZE} {FPS} fps {FRAMES} frames | gap_ms=p50/p95/p99/max', flush=True)
+    for clip in clips:
+        encode = ['-nostdin', '-loglevel', 'error', '-xerror', '-filter_threads', '1',
+                  '-f', 'lavfi', '-i', CLIPS[clip], '-vf', 'realtime', '-frames:v', str(FRAMES),
+                  '-an', '-c:v', 'libx264', '-threads', '2', '-preset', 'ultrafast', '-tune', 'zerolatency',
+                  '-sc_threshold', '0', '-g', str(FPS), '-crf', '28', '-f', 'nut', '-flush_packets', '1', 'pipe:1']
+        if guest:
+            wrapper = '#!/bin/sh\nprintf "!"\nexec ' + shlex.join(['./ffmpeg', *encode]) + ' 2>encode.err\n'
+            guest.command(f'echo {base64.b64encode(wrapper.encode()).decode()} | base64 -d > live-encode && chmod +x live-encode')
+        for run in range(1, repeats + 1):
+            with ExitStack() as stack, (work / 'live.nut').open('wb') as capture:
+                def process(args, **kwargs):
+                    proc = subprocess.Popen(args, cwd=work, **kwargs)
+                    stack.callback(proc.__exit__, None, None, None)
+                    stack.callback(proc.kill)
+                    return proc
+
+                decoder = process(decode, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                if guest:
+                    guest.vm.stdin.write(b'nc -l -p 9000 -e ./live-encode; echo LIVE_STATUS:$?\n')
+                    sock = stack.enter_context(connect())
+                    receive = sock.recv
+                else:
+                    encoder = process([ffmpeg, *encode], stdout=subprocess.PIPE, bufsize=0)
+                    receive = encoder.stdout.read
+                start = time.perf_counter()
+                ingress, errors = {}, []
+
+                def relay():
+                    try:
+                        with decoder.stdin:
+                            while data := receive(65536):
+                                ingress.setdefault('first', time.perf_counter())
+                                decoder.stdin.write(data)
+                                decoder.stdin.flush()
+                                capture.write(data)
+                            ingress['eof'] = time.perf_counter()
+                    except OSError as exc:
+                        errors.append(exc)
+
+                feeder = threading.Thread(target=relay, daemon=True)
+                feeder.start()
+                frames, timestamps = [], []
+                with selectors.DefaultSelector() as sel:
+                    sel.register(decoder.stdout, selectors.EVENT_READ)
+                    end = start + 30
+                    pending = b''
+                    while sel.select(max(0, end - time.perf_counter())):
+                        data = os.read(decoder.stdout.fileno(), 65536)
+                        now = time.perf_counter()
+                        if not data:
+                            break
+                        *lines, pending = (pending + data).split(b'\n')
+                        for line in lines:
+                            if line and not line.startswith(b'#'):
+                                frames.append(line)
+                                timestamps.append(now)
+                    else:
+                        raise TimeoutError('live decoder did not finish')
+                feeder.join(timeout=5)
+                if feeder.is_alive() or errors or pending or decoder.wait(timeout=5):
+                    raise RuntimeError(f'incomplete live decode: relay={errors}, trailing={pending!r}')
+                if guest:
+                    status = guest.until(b'localhost:/bench# ')
+                    if 'LIVE_STATUS:0' not in status:
+                        raise RuntimeError(status)
+                    guest.command('test ! -s encode.err || { cat encode.err; false; }')
+                elif encoder.wait(timeout=5):
+                    raise RuntimeError('host encoder failed')
+            offline = subprocess.check_output(decode, input=(work / 'live.nut').read_bytes())
+            pts = [int(line.split(b',')[2]) for line in frames]
+            if (not pts or pts != list(range(pts[0], pts[0] + FRAMES)) or frames != [line for line in offline.splitlines()
+                    if line and not line.startswith(b'#')]):
+                raise ValueError(f'live frame order/count/checksum mismatch ({len(frames)} frames, PTS {pts[:8]})')
+            gaps = [(b - a) * 1000 for a, b in zip(timestamps, timestamps[1:])]
+            before_eof = sum(t < ingress['eof'] for t in timestamps)
+            if not before_eof:
+                raise ValueError(f'no frames before EOF: first bytes={ingress["first"]-start:.3f}s EOF={ingress["eof"]-start:.3f}s first frame={timestamps[0]-start:.3f}s bytes={(work / "live.nut").stat().st_size}')
+            print(f'{clip} run={run} frames={len(frames)} pre_eof={before_eof} '
+                  f'bytes={(work / "live.nut").stat().st_size} '
+                  f'first_bytes_ms={(ingress["first"] - start) * 1000:.2f} '
+                  f'first_frame_ms={(timestamps[0] - start) * 1000:.2f} '
+                  f'last_frame_ms={(timestamps[-1] - start) * 1000:.2f} '
+                  f'eof_ms={(ingress["eof"] - start) * 1000:.2f} '
+                  f'eof_to_last_ms={(timestamps[-1] - ingress["eof"]) * 1000:.2f} '
+                  f'gap_ms={percentiles(gaps)} gaps_over_tick={sum(g > 1000 / FPS for g in gaps)}', flush=True)
 
 
 def benchmark(ffmpeg, repeats, work, guest=None, av1="libsvtav1", decoder="libdav1d", av1_crfs=("28", "38"), clips=CLIPS, av1_only=False):
@@ -227,7 +345,10 @@ if __name__ == '__main__':
     parser.add_argument('--guest-svt-tar', type=Path, help='trusted tar with Alpine usr/bin/SvtAv1EncApp and usr/lib dependencies; overrides --av1')
     parser.add_argument('--clips', nargs='+', choices=CLIPS, default=CLIPS)
     parser.add_argument('--av1-only', action='store_true')
+    parser.add_argument('--live-h264', action='store_true')
     args = parser.parse_args()
+    if args.live_h264 and (args.av1_only or args.guest_svt_tar):
+        parser.error('--live-h264 cannot be combined with AV1-only or guest SVT')
     if args.guest_svt_tar and not args.guest:
         parser.error('--guest-svt-tar requires --guest')
     if args.repeats < 1:
@@ -236,7 +357,15 @@ if __name__ == '__main__':
     with ExitStack() as stack:
         tmp = Path(stack.enter_context(tempfile.TemporaryDirectory(dir=os.getenv('COMMANDCODE_SCRATCHPAD'))))
         try:
-            guest = Guest(stack, tmp, args.guest[0].resolve(), args.guest[1], args.guest_svt_tar) if args.guest else None
-            benchmark(ffmpeg, args.repeats, tmp, guest, "SvtAv1EncApp" if args.guest_svt_tar else args.av1, args.av1_decoder, args.av1_crfs, args.clips, args.av1_only)
+            port = None
+            if args.live_h264 and args.guest:
+                with socket.socket() as sock:
+                    sock.bind(('127.0.0.1', 0))
+                    port = sock.getsockname()[1]
+            guest = Guest(stack, tmp, args.guest[0].resolve(), args.guest[1], args.guest_svt_tar, port) if args.guest else None
+            if args.live_h264:
+                live_h264(ffmpeg, args.repeats, tmp, guest, port, args.clips)
+            else:
+                benchmark(ffmpeg, args.repeats, tmp, guest, "SvtAv1EncApp" if args.guest_svt_tar else args.av1, args.av1_decoder, args.av1_crfs, args.clips, args.av1_only)
         except subprocess.CalledProcessError as exc:
             raise SystemExit(exc.stderr or str(exc)) from exc
