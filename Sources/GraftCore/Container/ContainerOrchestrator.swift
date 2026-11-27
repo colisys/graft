@@ -72,6 +72,38 @@ public final class ContainerOrchestrator: @unchecked Sendable {
     }
     public var imageName: String { baseImage.imageName }
 
+    // MARK: - Display backend
+
+    public var displayBackend: any DisplayBackend {
+        DisplayBackends.backend(for: runtimeSettings.displayBackendKind)
+    }
+
+    /// Resolved display session for the current base image and settings.
+    /// Keeping this value explicit is what lets the launch/profile code stop
+    /// assuming XQuartz everywhere.
+    public var displaySession: DisplaySession {
+        displayBackend.session(
+            for: baseImage,
+            settings: DisplayBackendSettings(
+                maxRefreshRate: runtimeSettings.maxRefreshRate,
+                shimAvailable: XRandRShim.isAvailable(for: baseImage),
+                indirectGLXEnabled: runtimeSettings.xquartzIGLXEnabled
+            )
+        )
+    }
+
+    /// Environment arguments shared by `docker run`, `docker exec` and source
+    /// installs. XQuartz currently contributes DISPLAY; a Wayland backend can
+    /// contribute WAYLAND_DISPLAY without touching callers.
+    private func displayEnvironmentArguments() -> [String] {
+        var environment = displaySession.containerEnvironment
+        environment["HOME"] = "/home/graft"
+        environment["XDG_RUNTIME_DIR"] = "/tmp/runtime-graft"
+        return environment
+            .sorted { $0.key < $1.key }
+            .flatMap { ["-e", "\($0.key)=\($0.value)"] }
+    }
+
     // MARK: - Docker plumbing
 
     private func requireDocker() throws -> String {
@@ -283,12 +315,10 @@ public final class ContainerOrchestrator: @unchecked Sendable {
         var arguments: [String] = [
             "run", "-d",
             "--name", containerName,
-            "--platform", host.architecture.dockerPlatform,
-            "-e", "DISPLAY=\(GraftConstants.display)",
-            "-e", "HOME=/home/graft",
-            "-e", "XDG_RUNTIME_DIR=/tmp/runtime-graft",
-            "--shm-size=2g"
+            "--platform", host.architecture.dockerPlatform
         ]
+        arguments.append(contentsOf: displayEnvironmentArguments())
+        arguments.append("--shm-size=2g")
         for (key, value) in base.localeEnvironment.sorted(by: { $0.key < $1.key }) {
             arguments.append(contentsOf: ["-e", "\(key)=\(value)"])
         }
@@ -663,10 +693,8 @@ public final class ContainerOrchestrator: @unchecked Sendable {
             docker,
             [
                 "exec",
-                "-u", GraftConstants.runtimeUser,
-                "-e", "DISPLAY=\(GraftConstants.display)",
-                "-e", "HOME=/home/graft",
-                "-e", "XDG_RUNTIME_DIR=/tmp/runtime-graft",
+                "-u", GraftConstants.runtimeUser
+            ] + displayEnvironmentArguments() + [
                 containerName,
                 "bash", "-lc", script
             ],
@@ -901,20 +929,12 @@ public final class ContainerOrchestrator: @unchecked Sendable {
 
     // MARK: - Launching
 
+    public func applicationProfile(for entry: DesktopEntry) -> ApplicationProfile {
+        ApplicationProfileResolver.profile(for: entry)
+    }
+
     public func isElectron(entry: DesktopEntry) -> Bool {
-        let known: Set<String> = [
-            "code", "code-insiders", "codium", "electron", "chromium",
-            "chromium-browser", "google-chrome", "google-chrome-stable",
-            "brave-browser", "slack", "discord", "obsidian", "notion",
-            "postman", "element-desktop", "signal-desktop", "figma-linux"
-        ]
-        if known.contains(entry.executableToken.lowercased()) {
-            return true
-        }
-        if entry.categories.contains(where: { $0.caseInsensitiveCompare("Electron") == .orderedSame }) {
-            return true
-        }
-        return entry.startupWMClass?.lowercased().contains("electron") == true
+        applicationProfile(for: entry).isChromiumFamily
     }
 
     /// Final argv executed inside the container.
@@ -922,40 +942,39 @@ public final class ContainerOrchestrator: @unchecked Sendable {
         for entry: DesktopEntry,
         includeRefreshEnvironment: Bool = true
     ) -> [String] {
+        let profile = applicationProfile(for: entry)
+        let display = displaySession
         var tokens = entry.execTokens
         if tokens.isEmpty {
             tokens = ["/bin/bash", "-lc", entry.exec]
         }
-        if isFirefox(entry: entry), !tokens.contains("MOZ_DISABLE_CONTENT_SANDBOX=1") {
-            tokens = ["env", "MOZ_DISABLE_CONTENT_SANDBOX=1"] + tokens
-        }
-        let shimRate = runtimeSettings.maxRefreshRate > 0
-            && XRandRShim.isAvailable(for: baseImage)
-            ? runtimeSettings.maxRefreshRate
-            : 0
-        if isElectron(entry: entry) {
-            if runtimeSettings.displayScale == 2 && !tokens.contains(where: { $0.hasPrefix("--force-device-scale-factor=") }) {
+
+        if profile.isChromiumFamily {
+            if runtimeSettings.displayScale == 2,
+               !tokens.contains(where: { $0.hasPrefix("--force-device-scale-factor=") }) {
                 tokens.append("--force-device-scale-factor=2")
             }
-            if !tokens.contains("--no-sandbox") {
+            if profile.requiresNoSandbox, !tokens.contains("--no-sandbox") {
                 tokens.append("--no-sandbox")
             }
-            // XQuartz only exposes GLX when enable_iglx is on. Without it,
-            // Chromium's GPU process cannot create a context and repeatedly
-            // falls back; keep the stable software path instead.
-            let gpuUsable = runtimeSettings.electronGPUEnabled
-                && runtimeSettings.xquartzIGLXEnabled
-            if gpuUsable {
-                tokens.removeAll { $0 == "--disable-gpu" }
-                for flag in ["--ignore-gpu-blocklist", "--enable-gpu-rasterization"]
-                where !tokens.contains(flag) {
-                    tokens.append(flag)
+            if profile.supportsGPUFlags {
+                // The backend decides whether a GPU path is even possible.
+                // On XQuartz this is only true with indirect GLX.
+                let gpuUsable = runtimeSettings.electronGPUEnabled && display.supportsGPU
+                if gpuUsable {
+                    tokens.removeAll { $0 == "--disable-gpu" }
+                    for flag in ["--ignore-gpu-blocklist", "--enable-gpu-rasterization"]
+                    where !tokens.contains(flag) {
+                        tokens.append(flag)
+                    }
+                } else if !tokens.contains("--disable-gpu") {
+                    tokens.append("--disable-gpu")
                 }
-            } else if !tokens.contains("--disable-gpu") {
-                tokens.append("--disable-gpu")
             }
-            if shimRate == 0 && runtimeSettings.electronFrameRateUnlockEnabled {
-                // Fallback for hosts where the XRandR shim is unavailable:
+            if profile.supportsFrameRateUnlock,
+               display.refreshRate == 0,
+               runtimeSettings.electronFrameRateUnlockEnabled {
+                // Fallback for hosts where the refresh shim is unavailable:
                 // remove the 1 Hz limit entirely. This can render faster than
                 // the macOS display, so it is only used when capped mode is
                 // not possible.
@@ -966,14 +985,13 @@ public final class ContainerOrchestrator: @unchecked Sendable {
             }
         }
 
-        var environment: [String] = []
-        if includeRefreshEnvironment && shimRate > 0 {
-            environment.append("LD_PRELOAD=\(XRandRShim.containerPath)")
-            environment.append("GRAFT_MAX_REFRESH=\(shimRate)")
+        var environment = profile.environment
+        if includeRefreshEnvironment {
+            environment.append(contentsOf: display.refreshEnvironment)
         }
         if runtimeSettings.displayScale == 2 {
             // Chromium uses its own device-scale factor; avoid applying GTK scaling twice.
-            if isElectron(entry: entry) {
+            if profile.usesChromiumScale {
                 environment.append("QT_SCALE_FACTOR=2")
             } else {
                 environment.append("GDK_SCALE=2")
@@ -984,10 +1002,6 @@ public final class ContainerOrchestrator: @unchecked Sendable {
         return ["dbus-run-session", "--"] + envPrefix + tokens
     }
 
-    private func isFirefox(entry: DesktopEntry) -> Bool {
-        entry.executableToken.lowercased() == "firefox"
-            || entry.name.lowercased().contains("firefox")
-    }
 
     public func launch(_ entry: DesktopEntry, ensureRuntime: Bool = true, progress: ProgressHandler? = nil) async throws {
         if ensureRuntime {
@@ -999,12 +1013,10 @@ public final class ContainerOrchestrator: @unchecked Sendable {
         let tokens = applicationTokens(for: entry)
         var arguments = [
             "exec", "-d",
-            "-u", GraftConstants.runtimeUser,
-            "-e", "DISPLAY=\(GraftConstants.display)",
-            "-e", "HOME=/home/graft",
-            "-e", "XDG_RUNTIME_DIR=/tmp/runtime-graft",
-            containerName
+            "-u", GraftConstants.runtimeUser
         ]
+        arguments.append(contentsOf: displayEnvironmentArguments())
+        arguments.append(containerName)
         arguments.append(contentsOf: tokens)
 
         progress?("正在启动 \(entry.name)…")

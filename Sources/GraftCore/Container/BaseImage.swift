@@ -257,6 +257,7 @@ public final class RuntimeSettings: @unchecked Sendable {
     private var storage: BaseImage = .ubuntu
     private var environmentNameStorage: String = ""
     private var mirrorStorage: String = ""
+    private var displayBackendStorage: DisplayBackendKind = .xquartz
     private var electronGPUStorage = false
     private var electronFrameRateUnlockStorage = false
     private var maxRefreshRateStorage = 0
@@ -282,6 +283,20 @@ public final class RuntimeSettings: @unchecked Sendable {
     public var environmentName: String {
         get { lock.lock(); defer { lock.unlock() }; return environmentNameStorage }
         set { lock.lock(); environmentNameStorage = newValue; lock.unlock() }
+    }
+
+    /// Display/transport implementation for this runtime.
+    public var displayBackendKind: DisplayBackendKind {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return displayBackendStorage
+        }
+        set {
+            lock.lock()
+            displayBackendStorage = newValue
+            lock.unlock()
+        }
     }
 
     /// Optional Docker registry prefix used when pulling the base image.

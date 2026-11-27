@@ -41,6 +41,12 @@ public final class EnvironmentManager: ObservableObject {
     /// Selected Linux base image. Changing it selects a different container
     /// (and a different package manager); installed applications are not
     /// migrated automatically.
+    @Published public var displayBackendKind: DisplayBackendKind = .xquartz {
+        didSet {
+            runtimeSettings.displayBackendKind = displayBackendKind
+        }
+    }
+
     @Published public var baseImage: BaseImage {
         didSet {
             guard baseImage != oldValue else { return }
@@ -306,6 +312,7 @@ public final class EnvironmentManager: ObservableObject {
             : UserDefaults.standard.bool(forKey: Self.autoSuspendDefaultsKey)
 
         SessionRegistry.prepare()
+        runtimeSettings.displayBackendKind = displayBackendKind
         let located = Self.locateTools()
         self.tools = located
         toolbox.tools = located

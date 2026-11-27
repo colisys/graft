@@ -518,6 +518,7 @@ final class AppModel: ObservableObject {
         let settings = RuntimeSettings()
         settings.baseImage = base
         settings.environmentName = environment.environmentName
+        settings.displayBackendKind = environment.displayBackendKind
         settings.registryMirror = environment.dockerRegistryMirror
         settings.electronGPUEnabled = environment.electronGPUEnabled
         let maxRefreshRate = environment.maxRefreshRate(for: base)
@@ -542,6 +543,7 @@ final class AppModel: ObservableObject {
         settings.environmentName = containerName.hasPrefix(prefix)
             ? String(containerName.dropFirst(prefix.count))
             : ""
+        settings.displayBackendKind = environment.displayBackendKind
         settings.registryMirror = environment.dockerRegistryMirror
         settings.electronGPUEnabled = environment.electronGPUEnabled
         let maxRefreshRate = environment.maxRefreshRate(for: base)
@@ -627,6 +629,7 @@ final class AppModel: ObservableObject {
         let settings = RuntimeSettings()
         settings.baseImage = base
         settings.environmentName = name
+        settings.displayBackendKind = environment.displayBackendKind
         settings.registryMirror = environment.dockerRegistryMirror
         let maxRefreshRate = environment.maxRefreshRate(for: base)
         settings.maxRefreshRate = maxRefreshRate
@@ -896,6 +899,7 @@ final class AppModel: ObservableObject {
         target: ContainerOrchestrator
     ) -> LauncherConfiguration {
         let shim = XRandRShim.hostURL(for: base)
+        let displaySession = target.displaySession
         let maxRefreshRate = environment.maxRefreshRate(for: base)
         let autoMaxRefreshRate =
             environment.maxRefreshRateMode == .matchDisplay && maxRefreshRate > 0
@@ -904,7 +908,7 @@ final class AppModel: ObservableObject {
             colimaStartArguments: environment.colimaStartArguments,
             containerRunArguments: target.containerRunArguments(),
             containerName: target.containerName,
-            display: GraftConstants.display,
+            display: displaySession.containerDisplay,
             launchTokens: target.applicationTokens(
                 for: entry,
                 includeRefreshEnvironment: false
@@ -917,7 +921,8 @@ final class AppModel: ObservableObject {
             presetID: presetID,
             xrandrShimPath: shim?.path,
             maxRefreshRate: maxRefreshRate,
-            autoMaxRefreshRate: autoMaxRefreshRate
+            autoMaxRefreshRate: autoMaxRefreshRate,
+            displayBackend: displaySession.kind
         )
     }
 

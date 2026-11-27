@@ -422,6 +422,16 @@ shim 同时拦截 Xlib 与 XCB 的 XRandR 响应，只改写客户端看到的�
 
 「设置 → 图形性能 → 最大刷新率」可选：匹配 macOS、30、60、120 Hz、不限制（旧行为）。上限不会超过当前显示器刷新率；例如显示器是 60 Hz 时，选择 120 Hz 实际仍按 60 Hz 上报。已封装 `.app` 的启动脚本会在下次启动 Graft 时按当前设置自动重写（正在运行的应用会跳过，下次启动再更新）；正在运行的 Linux 应用需重启。若 shim 无法加载，Graft 会回退到旧的 `--disable-frame-rate-limit` 行为。
 
+### 8.5 Wayland 实验
+
+Linux 侧最小冒烟测试：
+
+```sh
+./scripts/wayland-smoke.sh
+```
+
+该脚本在临时 Arch 容器里启动 Weston headless，并用 `wayland-info` 验证 `wl_compositor`、`xdg_wm_base`、`wl_shm`、`wl_output` 等协议。它证明容器侧 Wayland 链路可用，但**不证明 Graft 已能在 macOS 上显示 Wayland 窗口**：当前 `WaylandDisplayBackend` 仍是 `implemented=false` 的占位实现，`.app` launcher 对 Wayland 会明确拒绝。macOS compositor 和输入/剪贴板/IME 仍是后续工作。
+
 ### 8.4.2 性能取舍
 
 - **Colima CPU**：Graft 最多分配 `host CPU - 1` 个 vCPU，至少给 macOS/XQuartz 留一个核心。4 核机器不要给 VM 4 核，否则 WindowServer、XQuartz 会和 VS Code 抢 CPU。

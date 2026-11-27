@@ -22,6 +22,10 @@ public struct LauncherConfiguration: Sendable {
     public var xrandrShimPath: String?
     public var maxRefreshRate: Int
     public var autoMaxRefreshRate: Bool
+    /// The backend that produced this wrapper. Only the XQuartz script
+    /// builder is implemented so far; other backends fail explicitly instead
+    /// of silently generating a launcher with XQuartz assumptions.
+    public var displayBackend: DisplayBackendKind
 
     public init(
         tools: ToolLocations,
@@ -38,7 +42,8 @@ public struct LauncherConfiguration: Sendable {
         presetID: String? = nil,
         xrandrShimPath: String? = nil,
         maxRefreshRate: Int = 0,
-        autoMaxRefreshRate: Bool = false
+        autoMaxRefreshRate: Bool = false,
+        displayBackend: DisplayBackendKind = .xquartz
     ) {
         self.tools = tools
         self.colimaStartArguments = colimaStartArguments
@@ -55,6 +60,7 @@ public struct LauncherConfiguration: Sendable {
         self.xrandrShimPath = xrandrShimPath
         self.maxRefreshRate = max(0, maxRefreshRate)
         self.autoMaxRefreshRate = autoMaxRefreshRate
+        self.displayBackend = displayBackend
     }
 }
 
@@ -71,6 +77,13 @@ public enum LauncherScriptBuilder {
         configuration: LauncherConfiguration,
         sessionID: String
     ) -> String {
+        guard configuration.displayBackend == .xquartz else {
+            return """
+            #!/bin/bash
+            echo "Graft: the \(configuration.displayBackend.displayName) display backend does not support generated .app launchers yet." >&2
+            exit 1
+            """
+        }
         let quote = ShellQuote.quote
         let startArguments = ShellQuote.join(configuration.colimaStartArguments)
         let runArguments = ShellQuote.join(configuration.containerRunArguments)
