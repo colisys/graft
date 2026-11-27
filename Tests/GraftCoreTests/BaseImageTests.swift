@@ -249,10 +249,18 @@ final class BaseImageTests: XCTestCase {
         XCTAssertTrue(defaultTokens.contains("--no-sandbox"))
 
         settings.electronGPUEnabled = true
+        // XQuartz only provides GLX when IGLX is enabled.
+        settings.xquartzIGLXEnabled = true
         let gpuTokens = orchestrator.applicationTokens(for: entry)
         XCTAssertFalse(gpuTokens.contains("--disable-gpu"))
         XCTAssertTrue(gpuTokens.contains("--ignore-gpu-blocklist"))
         XCTAssertTrue(gpuTokens.contains("--no-sandbox"))
+
+        // Enabling GPU without IGLX must stay on the stable software path.
+        settings.xquartzIGLXEnabled = false
+        let noGLXTokens = orchestrator.applicationTokens(for: entry)
+        XCTAssertTrue(noGLXTokens.contains("--disable-gpu"))
+        XCTAssertFalse(noGLXTokens.contains("--ignore-gpu-blocklist"))
     }
 
     @MainActor

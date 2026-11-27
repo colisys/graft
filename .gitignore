@@ -22,3 +22,6 @@ DerivedData/
 
 # Command Code tooling
 .commandcode/
+
+# Wayland experiment worktree
+exp-wayland/

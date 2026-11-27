@@ -157,6 +157,17 @@ public final class EnvironmentManager: ObservableObject {
         return hz
     }
 
+    /// Apply the conservative settings that give the best chance of a smooth
+    /// first run on a machine without GPU passthrough.
+    public func applyRecommendedPerformanceSettings() {
+        electronGPUEnabled = false
+        xquartzIGLXEnabled = false
+        maxRefreshRateMode = .matchDisplay
+        displayScale = 1
+        colimaCPU = min(max(host.recommendedColimaCPU, 2), maxColimaCPU)
+        colimaMemoryGB = min(max(host.recommendedColimaMemoryGB, 2), maxColimaMemoryGB)
+    }
+
     private func applyMaxRefreshRate() {
         let hz = maxRefreshRate(for: baseImage)
         runtimeSettings.maxRefreshRate = hz

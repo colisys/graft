@@ -273,11 +273,24 @@ struct SettingsView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            Button("重启 Colima") {
-                Task { await model.restartColimaNow() }
+            HStack(spacing: 8) {
+                Button("重启 Colima") {
+                    Task { await model.restartColimaNow() }
+                }
+                .controlSize(.small)
+                .disabled(model.isBusy || model.isActionPending || environment.tools.colima == nil)
+
+                Button("应用推荐性能设置") {
+                    environment.applyRecommendedPerformanceSettings()
+                    model.notifySettingChanged("推荐性能设置")
+                }
+                .controlSize(.small)
+                .disabled(model.isBusy || model.isActionPending)
+
+                Text("关闭实验 GPU、刷新率匹配显示器、保留 1 个宿主核心、使用推荐内存。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
-            .controlSize(.small)
-            .disabled(model.isBusy || model.isActionPending || environment.tools.colima == nil)
         }
     }
 
@@ -311,8 +324,15 @@ struct SettingsView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            if environment.electronGPUEnabled {
-                Label("XQuartz 没有 Apple GPU 直通。若 VS Code 等 Electron 应用卡顿或日志出现 ANGLE/EGL 初始化失败，请关闭此开关并重启应用。", systemImage: "exclamationmark.triangle")
+            if environment.electronGPUEnabled && !environment.xquartzIGLXEnabled {
+                Label("当前 XQuartz 没有启用间接 GLX，GPU 合成不会生效；Graft 会自动回退到 --disable-gpu。若确实要测试，请先启用下方的间接 GLX 并重启 XQuartz。", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if environment.electronGPUEnabled && environment.xquartzIGLXEnabled {
+                Label("即使启用间接 GLX，XQuartz 也没有 Apple GPU 直通；VS Code 等 Electron 应用仍可能因 ANGLE/EGL 失败而更慢。性能优先时建议关闭 GPU 开关。", systemImage: "exclamationmark.triangle")
                     .font(.caption)
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)

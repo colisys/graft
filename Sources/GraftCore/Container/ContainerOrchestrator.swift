@@ -940,7 +940,12 @@ public final class ContainerOrchestrator: @unchecked Sendable {
             if !tokens.contains("--no-sandbox") {
                 tokens.append("--no-sandbox")
             }
-            if runtimeSettings.electronGPUEnabled {
+            // XQuartz only exposes GLX when enable_iglx is on. Without it,
+            // Chromium's GPU process cannot create a context and repeatedly
+            // falls back; keep the stable software path instead.
+            let gpuUsable = runtimeSettings.electronGPUEnabled
+                && runtimeSettings.xquartzIGLXEnabled
+            if gpuUsable {
                 tokens.removeAll { $0 == "--disable-gpu" }
                 for flag in ["--ignore-gpu-blocklist", "--enable-gpu-rasterization"]
                 where !tokens.contains(flag) {

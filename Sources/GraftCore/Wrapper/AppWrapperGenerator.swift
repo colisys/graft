@@ -305,8 +305,7 @@ public final class AppWrapperGenerator {
             .appendingPathComponent("Contents", isDirectory: true)
             .appendingPathComponent("Resources", isDirectory: true)
             .appendingPathComponent("launch.sh")
-        guard let current = try? String(contentsOf: scriptURL, encoding: .utf8),
-              !current.contains("GRAFT_PID_FILE") else { return false }
+        guard let current = try? String(contentsOf: scriptURL, encoding: .utf8) else { return false }
 
         let bundleName = bundleURL.deletingPathExtension().lastPathComponent
         let sessionID = sanitizeIdentifier(bundleName)
@@ -320,13 +319,16 @@ public final class AppWrapperGenerator {
             configuration: configuration,
             sessionID: sessionID
         )
+        // Regenerate when settings such as GPU mode, refresh cap or shim paths
+        // change; a matching script needs no write.
+        guard script != current else { return false }
         do {
             try script.write(to: scriptURL, atomically: true, encoding: .utf8)
             try fileManager.setAttributes(
                 [.posixPermissions: 0o755],
                 ofItemAtPath: scriptURL.path
             )
-            log.append("已更新 \(bundleName).app 的启动器（退出应用时清理容器进程）", level: .info)
+            log.append("已更新 \(bundleName).app 的启动器（应用新设置）", level: .info)
             return true
         } catch {
             log.append(
