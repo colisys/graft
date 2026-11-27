@@ -12,7 +12,7 @@ Linux Wayland SHM → ext4 DAX / `virtio-pmem` → macOS AppKit。本机：Intel
 
 ## 复现
 
-M2 验证脚本放在本地 `docs/sclereid/m2/`，不随仓库分发。在已登录桌面会话的 Intel Mac 上准备 QEMU/HVF、Python 3、Zig、Swift 命令行工具、`curl`、`bsdtar` 和 [Alpine standard 3.22.2 x86_64 ISO](../m1/m1-memory.md#default-probe-profile)。从仓库根目录运行：
+验证入口为 [`sclereid-m2.py`](sclereid-m2.py)，来宾桥、AppKit 窗口程序和 Weston 依赖准备脚本均位于同一目录。在已登录桌面会话的 Intel Mac 上准备 QEMU/HVF、Python 3、Zig、Swift 命令行工具、`curl`、`bsdtar` 和 [Alpine standard 3.22.2 x86_64 ISO](../m1/m1-memory.md#default-probe-profile)。从仓库根目录运行：
 
 ```sh
 iso=/path/to/alpine-standard-3.22.2-x86_64.iso
