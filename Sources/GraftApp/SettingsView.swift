@@ -9,7 +9,7 @@ struct SettingsView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+            LazyVStack(alignment: .leading, spacing: 16) {
                 baseImagePanel
                 environmentsPanel
                 containersPanel
@@ -719,7 +719,7 @@ struct SettingsView: View {
         subtitle: String? = nil,
         @ViewBuilder content: () -> Content
     ) -> some View {
-        GraftPanel {
+        GraftPanel(style: .solid) {
             VStack(alignment: .leading, spacing: 12) {
                 GraftSectionTitle(title, subtitle: subtitle)
                 content()

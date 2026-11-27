@@ -6,6 +6,9 @@ import Foundation
 public enum XRandRShim {
     public static let containerPath = "/usr/local/lib/libgraft-xrandr-refresh.so"
 
+    private static let installLock = NSLock()
+    private static var didInstall = false
+
     public static var installedDirectory: URL {
         SessionRegistry.supportDirectory.appendingPathComponent("Shims", isDirectory: true)
     }
@@ -83,6 +86,14 @@ public enum XRandRShim {
     /// with the same size are left untouched.
     @discardableResult
     public static func installBundledShims() -> Int {
+        installLock.lock()
+        if didInstall {
+            installLock.unlock()
+            return 0
+        }
+        didInstall = true
+        installLock.unlock()
+
         let fileManager = FileManager.default
         try? fileManager.createDirectory(
             at: installedDirectory,

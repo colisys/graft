@@ -1,16 +1,32 @@
 import SwiftUI
 import AppKit
 
+enum GraftPanelStyle {
+    case material
+    case solid
+}
+
 /// Card style shared with MFan / MFish: regular material, continuous rounded
-/// corners and a hairline border.
+/// corners and a hairline border. Settings uses the solid variant because a
+/// long page with many live-blur material layers is expensive on Intel Macs.
 struct GraftPanel<Content: View>: View {
+    var style: GraftPanelStyle = .material
     @ViewBuilder let content: Content
 
     var body: some View {
         content
             .padding(18)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .background {
+                switch style {
+                case .material:
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(.regularMaterial)
+                case .solid:
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(Color(nsColor: .controlBackgroundColor).opacity(0.88))
+                }
+            }
             .overlay {
                 RoundedRectangle(cornerRadius: 16, style: .continuous)
                     .stroke(.primary.opacity(0.07), lineWidth: 1)
