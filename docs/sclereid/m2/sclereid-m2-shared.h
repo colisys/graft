@@ -1,11 +1,22 @@
 /* Bounded shared XDG smoke compositor. Slots are not recycled until host ACK. */
 enum { NSURF = 8 };
 static struct shared_surface {
-    struct wl_resource *s, *xd, *top, *buf, *cb, *submitted_cb;
+    struct wl_resource *s, *xd, *top, *popup, *buf, *cb, *submitted_cb;
     struct wl_listener gone;
     unsigned id, seq, serial;
     int scale, pending_scale, attached, configured, busy, mapped_w, mapped_h;
     int resize_w, resize_h;
+    int geometry[4], pending_geometry[4];
+    int popup_x, popup_y, popup_w, popup_h, dismissed;
+    struct shared_surface *parent, *sub_parent;
+    struct wl_resource *sub;
+    int sub_role, x, y, next_x, next_y, sub_w, sub_h, visible_scale;
+    unsigned char *cached, *visible;
+    unsigned char *base;
+    int base_w, base_h, repaint, deferred, deferred_scale, frame_scale;
+    struct wl_resource *deferred_cb;
+    int cached_w, cached_h, dirty;
+
 } windows[NSURF];
 static unsigned next_id, session_base;
 static void shared_event(const char *kind, unsigned id) {
@@ -14,6 +25,8 @@ static void shared_event(const char *kind, unsigned id) {
 static struct wl_list devices;
 static struct shared_surface *pointer_focus, *key_focus;
 static int pressed;
+static struct shared_surface *grab, *press_owner;
+static uint32_t press_serial;
 static unsigned char held_keys[128];
 static void device_gone(struct wl_resource *r) { wl_list_remove(wl_resource_get_link(r)); }
 static void ignore_cursor(struct wl_client *c,struct wl_resource *r,uint32_t serial,struct wl_resource *s,int32_t x,int32_t y) {
@@ -34,8 +47,18 @@ static void device(struct wl_client *c, uint32_t id, int version, const struct w
     if(type==&wl_keyboard_interface) {
         int fd=memfd_create("m2-xkb",MFD_CLOEXEC);
         if(fd<0) sysfail("keymap fd");
-        if(write(fd,seat_map,sizeof seat_map)!=sizeof seat_map) sysfail("write keymap");
-        wl_keyboard_send_keymap(r,WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1,fd,sizeof seat_map); close(fd);
+        char *compiled=NULL;
+        if(getenv("XKB_CONFIG_ROOT")) {
+            struct xkb_context *ctx=xkb_context_new(0);
+            struct xkb_rule_names names={.layout="us"};
+            struct xkb_keymap *map=ctx?xkb_keymap_new_from_names(ctx,&names,0):NULL;
+            if(!map || !(compiled=xkb_keymap_get_as_string(map,XKB_KEYMAP_FORMAT_TEXT_V1))) fail("compile US keymap");
+            xkb_keymap_unref(map); xkb_context_unref(ctx);
+        }
+        const char *text=compiled?compiled:seat_map;
+        size_t length=strlen(text)+1;
+        if(write(fd,text,length)!=(ssize_t)length) sysfail("write keymap");
+        wl_keyboard_send_keymap(r,WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1,fd,length); close(fd); free(compiled);
     }
 }
 static void pointer(struct wl_client *c,struct wl_resource *r,uint32_t id) { device(c,id,wl_resource_get_version(r),&wl_pointer_interface); }
@@ -72,7 +95,11 @@ static void deliver(struct shared_surface *p,char op,int x,int y) {
             if(op=='E') wl_pointer_send_enter(r,serial,p->s,wl_fixed_from_int(x),wl_fixed_from_int(y));
             if(op=='P') wl_pointer_send_leave(r,serial,p->s);
             if(op=='M') wl_pointer_send_motion(r,t,wl_fixed_from_int(x),wl_fixed_from_int(y));
-            if(op=='B') wl_pointer_send_button(r,serial,t,272,x);
+            if(op=='W') wl_pointer_send_axis(r,t,x,wl_fixed_from_int(y));
+            if(op=='B') {
+                wl_pointer_send_button(r,serial,t,272+y,x);
+                if(x) { press_serial=serial; press_owner=p; }
+            }
         } else {
             if(op=='F') { struct wl_array keys={0}; wl_keyboard_send_enter(r,serial,p->s,&keys); wl_keyboard_send_modifiers(r,serial,0,0,0,0); }
             if(op=='L') wl_keyboard_send_leave(r,serial,p->s);
@@ -84,13 +111,63 @@ static void release_keys(struct shared_surface *p) {
     for(int code=1;code<128;code++) if(held_keys[code]) { deliver(p,'K',code,0); held_keys[code]=0; }
 }
 static void blur(struct shared_surface *p) {
-    if(pointer_focus==p) { if(pressed) deliver(p,'B',0,0); pressed=0; deliver(p,'P',0,0); pointer_focus=NULL; }
+    if(press_owner==p) press_owner=NULL;
+    if(grab==p) grab=NULL;
+    if(pointer_focus==p) { for(int k=0;k<2;k++) if(pressed&(1<<k)) deliver(p,'B',0,k); pressed=0; deliver(p,'P',0,0); pointer_focus=NULL; }
     if(key_focus==p) { release_keys(p); deliver(p,'L',0,0); key_focus=NULL; }
+}
+static void cancel_repaint(struct shared_surface *p);
+static void dismiss_children(struct shared_surface *parent) {
+    for (int i=0; i<NSURF; i++) {
+        struct shared_surface *p = &windows[i];
+        if (p->parent != parent) continue;
+        p->parent = NULL;
+        p->dismissed = 1;
+        blur(p);
+        if (!host_lost) {
+            wl_resource_post_event(p->popup, 1);
+            if (p->mapped_w) shared_event("CLOSED", p->id);
+        }
+        p->mapped_w = p->mapped_h = 0;
+        cancel_repaint(p);
+        if (p->cb) wl_resource_destroy(p->cb);
+        if (p->submitted_cb) wl_resource_destroy(p->submitted_cb);
+    }
+}
+struct positioner { int w,h,x,y,rw,rh,dx,dy; unsigned anchor,gravity; };
+static int positioner_dispatch(const void *iface, void *target, uint32_t op, const struct wl_message *msg, union wl_argument *a) {
+    (void)iface; (void)msg;
+    struct wl_resource *r = target;
+    struct positioner *q = wl_resource_get_user_data(r);
+    switch (op) {
+    case 0: wl_resource_destroy(r); return 0;
+    case 1: if (a[0].i<1 || a[1].i<1) break; q->w=a[0].i; q->h=a[1].i; return 0;
+    case 2: if (a[2].i<1 || a[3].i<1) break;
+        q->x=a[0].i; q->y=a[1].i; q->rw=a[2].i; q->rh=a[3].i; return 0;
+    case 3: if (a[0].u>8) break; q->anchor=a[0].u; return 0;
+    case 4: if (a[0].u>8) break; q->gravity=a[0].u; return 0;
+    case 5: if (a[0].u & ~63u) break; return 0;
+    case 6: q->dx=a[0].i; q->dy=a[1].i; return 0;
+    }
+    wl_resource_post_error(r,0,"invalid positioner argument"); return 0;
+}
+static void positioner_free(struct wl_resource *r) { free(wl_resource_get_user_data(r)); }
+static int placement(struct shared_surface *p, struct shared_surface *parent, const struct positioner *q) {
+    static const int xdir[]={0,0,0,-1,1,-1,-1,1,1}, ydir[]={0,-1,1,0,0,-1,1,-1,1};
+    int pw=parent->geometry[2] ?: parent->mapped_w, ph=parent->geometry[3] ?: parent->mapped_h;
+    if (!q->w || !q->h || !q->rw || !q->rh || q->x<0 || q->y<0 || q->rw>pw || q->rh>ph || q->x>pw-q->rw || q->y>ph-q->rh || q->w>width || q->h>height) return 0;
+    int64_t x=(int64_t)q->x + (1+xdir[q->anchor])*q->rw/2 - (1-xdir[q->gravity])*q->w/2 + q->dx;
+    int64_t y=(int64_t)q->y + (1+ydir[q->anchor])*q->rh/2 - (1-ydir[q->gravity])*q->h/2 + q->dy;
+    if (x>pw || y>ph || x < -q->w || y < -q->h) return 0;
+    p->popup_x=x; p->popup_y=y; p->popup_w=q->w; p->popup_h=q->h;
+    p->parent=parent;
+    return 1;
 }
 static void shared_configure(struct shared_surface *p, int w, int h) {
     struct wl_array states = {0};
     p->serial = wl_display_next_serial(display);
-    wl_resource_post_event(p->top, 0, w, h, &states);
+    if (p->popup) wl_resource_post_event(p->popup, 0, p->popup_x, p->popup_y, p->popup_w, p->popup_h);
+    else wl_resource_post_event(p->top, 0, w, h, &states);
     wl_resource_post_event(p->xd, 0, p->serial);
 }
 static void shared_resize(struct shared_surface *p) {
@@ -101,11 +178,18 @@ static void shared_resize(struct shared_surface *p) {
 static void seat_input(unsigned id,char op,int x,int y) {
     for(int i=0;i<NSURF;i++) {
         struct shared_surface *p=&windows[i];
-        if(p->id!=id || !p->s || !p->top || !p->mapped_w) continue;
+        if(p->id!=id || !p->s || (!p->top && !p->popup) || !p->mapped_w) continue;
+        if(grab && p!=grab && op!='R' && op!='C' && op!='L') {
+            if(op=='B' && x==1 && y>=0 && y<2 && grab->mapped_w) dismiss_children(grab->parent);
+            return;
+        }
+        if(p->popup && (op=='C' || op=='R')) return;
         if(op=='C') wl_resource_post_event(p->top,1);
         else if(op=='R' && x>0 && y>0) {
             p->resize_w = x <= width/p->scale ? x : width/p->scale;
             p->resize_h = y <= height/p->scale ? y : height/p->scale;
+            if (p->busy && !getenv("XKB_CONFIG_ROOT"))
+                fprintf(stderr,"M2_RESIZE_PENDING %u %d %d\n",id,p->resize_w,p->resize_h);
             shared_resize(p);
         } else if(op=='M' && x>=0 && y>=0 && x<p->mapped_w && y<p->mapped_h) {
             if(pointer_focus!=p) {
@@ -113,18 +197,92 @@ static void seat_input(unsigned id,char op,int x,int y) {
                 deliver(pointer_focus,'P',0,0); pointer_focus=p; deliver(p,'E',x,y);
             }
             deliver(p,op,x,y);
-        } else if(op=='B' && pointer_focus==p && (x==0 || x==1) && x!=pressed) {
+        } else if(op=='B' && pointer_focus==p && (x==0 || x==1) && y>=0 && y<2 && x!=!!(pressed&(1<<y))) {
             if(x && key_focus!=p) {
                 release_keys(key_focus); deliver(key_focus,'L',0,0); key_focus=p; deliver(p,'F',0,0);
             }
-            pressed=x; deliver(p,op,x,0);
-        } else if(op=='K' && key_focus==p && x>0 && x<128 && (y==0 || y==1) && held_keys[x]!=y) { held_keys[x]=y; deliver(p,op,x,y); }
+            pressed ^= 1<<y; deliver(p,op,x,y);
+        } else if(op=='W' && pointer_focus==p && (x==0 || x==1) && y>=-120 && y<=120) deliver(p,op,x,y);
+        else if(op=='K' && key_focus==p && x>0 && x<128 && (y==0 || y==1) && held_keys[x]!=y) { held_keys[x]=y; deliver(p,op,x,y); }
         else if(op=='L') blur(p);
     }
 }
+static void sub_clear(struct shared_surface *p) {
+    if (p->sub_parent && p->visible) p->sub_parent->repaint=1;
+    free(p->cached); free(p->visible);
+    p->cached = p->visible = NULL;
+    p->dirty = p->sub_w = p->sub_h = 0;
+    p->sub_parent = NULL;
+}
+static void sub_destroyed(struct wl_resource *r) {
+    struct shared_surface *p = wl_resource_get_user_data(r);
+    sub_clear(p);
+    p->sub = NULL;
+}
+static void sub_position(struct wl_client *c, struct wl_resource *r, int32_t x, int32_t y) {
+    (void)c;
+    struct shared_surface *p = wl_resource_get_user_data(r);
+    p->next_x = x; p->next_y = y;
+}
+static void sub_unsupported(struct wl_client *c, struct wl_resource *r) {
+    (void)c;
+    wl_resource_post_error(r, 0, "only synchronized subsurfaces supported");
+}
+static void sub_sync(struct wl_client *c, struct wl_resource *r) { (void)c; (void)r; }
+static void sub_stack(struct wl_client *c, struct wl_resource *r, struct wl_resource *s) {
+    (void)s;
+    sub_unsupported(c,r);
+}
+static void get_sub(struct wl_client *c, struct wl_resource *r, uint32_t id,
+                    struct wl_resource *child, struct wl_resource *parent) {
+    struct shared_surface *p = wl_resource_get_user_data(child), *q = wl_resource_get_user_data(parent);
+    if (p == q || p->xd || p->sub || !q->top) {
+        wl_resource_post_error(r, WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE, "expected direct toplevel child");
+        return;
+    }
+    static const struct wl_subsurface_interface ops = {
+        .destroy=destroy_resource, .set_position=sub_position, .place_above=sub_stack,
+        .place_below=sub_stack, .set_sync=sub_sync, .set_desync=sub_unsupported
+    };
+    p->sub = wl_resource_create(c,&wl_subsurface_interface,1,id);
+    if (!p->sub) { wl_client_post_no_memory(c); return; }
+    p->sub_role=1; p->sub_parent=q;
+    p->next_x=p->next_y=0;
+    wl_resource_set_implementation(p->sub,&ops,p,sub_destroyed);
+}
+static void bind_sub(struct wl_client *c, void *data, uint32_t v, uint32_t id) {
+    (void)data;
+    static const struct wl_subcompositor_interface ops={.destroy=destroy_resource,.get_subsurface=get_sub};
+    struct wl_resource *r=wl_resource_create(c,&wl_subcompositor_interface,v,id);
+    if (!r) { wl_client_post_no_memory(c); return; }
+    wl_resource_set_implementation(r,&ops,NULL,NULL);
+}
+static void cancel_repaint(struct shared_surface *p) {
+    p->repaint=p->deferred=0;
+    if (p->deferred_cb) wl_resource_destroy(p->deferred_cb);
+}
 static void shared_clear(struct wl_resource *r) {
     struct shared_surface *p = wl_resource_get_user_data(r);
-    if (p->s == r || p->top == r) blur(p);
+    if (p->s == r || p->top == r || p->xd == r) {
+        free(p->base); p->base=NULL;
+        dismiss_children(p);
+        for (int i=0;i<NSURF;i++) if (windows[i].sub_parent==p) sub_clear(&windows[i]);
+        cancel_repaint(p);
+        if (p->cb) wl_resource_destroy(p->cb);
+        if (p->submitted_cb) wl_resource_destroy(p->submitted_cb);
+    }
+    if (p->s == r && p->sub_role) sub_clear(p);
+    if (p->s == r || p->top == r || p->popup == r) blur(p);
+    if (p->popup == r) {
+        cancel_repaint(p);
+        if (p->mapped_w && !host_lost) shared_event("CLOSED",p->id);
+        p->mapped_w = p->mapped_h = 0;
+        p->parent = NULL;
+        p->popup = NULL;
+        if (p->cb) wl_resource_destroy(p->cb);
+        if (p->submitted_cb) wl_resource_destroy(p->submitted_cb);
+    }
+    if (p->deferred_cb == r) p->deferred_cb = NULL;
     if (p->cb == r) p->cb = NULL;
     if (p->submitted_cb == r) p->submitted_cb = NULL;
     if (p->xd == r) p->xd = NULL;
@@ -155,45 +313,157 @@ static void shared_callback(struct wl_client *c, struct wl_resource *r, uint32_t
     if (!p->cb) { wl_client_post_no_memory(c); return; }
     wl_resource_set_implementation(p->cb, NULL, p, shared_clear);
 }
+static void sub_commit(struct shared_surface *p) {
+    if (!p->attached) return;
+    if (!p->sub_parent) {
+        p->attached=0;
+        if (p->buf) {
+            wl_list_remove(&p->gone.link);
+            wl_buffer_send_release(p->buf); p->buf=NULL;
+        }
+        return;
+    }
+    p->attached=0;
+    unsigned char *copy=NULL;
+    int w=0,h=0;
+    if (p->buf) {
+        struct wl_shm_buffer *b=wl_shm_buffer_get(p->buf);
+        if (!b || wl_shm_buffer_get_format(b)!=WL_SHM_FORMAT_XRGB8888) goto invalid;
+        w=wl_shm_buffer_get_width(b); h=wl_shm_buffer_get_height(b);
+        int stride=wl_shm_buffer_get_stride(b);
+        if (w<1 || h<1 || w>width || h>height || stride<w*4 || w%p->pending_scale || h%p->pending_scale) goto invalid;
+        copy=malloc((size_t)w*h*4);
+        if (!copy) { wl_resource_post_no_memory(p->s); return; }
+        wl_shm_buffer_begin_access(b);
+        const unsigned char *src=wl_shm_buffer_get_data(b);
+        for (int y=0;y<h;y++) memcpy(copy+y*w*4,src+(size_t)y*stride,w*4);
+        wl_shm_buffer_end_access(b);
+        wl_list_remove(&p->gone.link);
+        wl_buffer_send_release(p->buf); p->buf=NULL;
+    }
+    free(p->cached); p->cached=copy;
+    p->cached_w=w; p->cached_h=h; p->scale=p->pending_scale; p->dirty=1;
+    return;
+invalid:
+    wl_resource_post_error(p->s,0,"unsupported subsurface buffer");
+}
+static void sub_apply(struct shared_surface *parent) {
+    for (int i=0;i<NSURF;i++) {
+        struct shared_surface *p=&windows[i];
+        if (p->sub_parent!=parent) continue;
+        p->x=p->next_x; p->y=p->next_y;
+        if (p->dirty) {
+            free(p->visible); p->visible=p->cached; p->cached=NULL;
+            p->sub_w=p->cached_w; p->sub_h=p->cached_h; p->visible_scale=p->scale; p->dirty=0;
+        }
+    }
+}
+static void sub_draw(struct shared_surface *parent, unsigned char *dst, int w, int h, int scale) {
+    for (int i=0;i<NSURF;i++) {
+        struct shared_surface *p=&windows[i];
+        if (p->sub_parent!=parent || !p->visible) continue;
+        int64_t ox=(int64_t)p->x*scale, oy=(int64_t)p->y*scale;
+        for (int y=0;y<h;y++) {
+            int64_t sy=(y-oy)*p->visible_scale/scale;
+            if (y<oy || sy>=p->sub_h) continue;
+            for (int x=0;x<w;x++) {
+                int64_t sx=(x-ox)*p->visible_scale/scale;
+                if (x<ox || sx>=p->sub_w) continue;
+                unsigned char *d=dst+(y*w+x)*4;
+                memcpy(d,p->visible+(sy*p->sub_w+sx)*4,3); d[3]=255;
+            }
+        }
+    }
+}
+static void shared_publish(struct shared_surface *p, int scale, struct wl_resource *cb) {
+    int w=p->base_w, h=p->base_h;
+    unsigned slot=(unsigned)(p-windows);
+    unsigned char *dst=frame+slot*RANGE;
+    memcpy(dst+PREFIX,p->base,(size_t)w*h*4);
+    p->repaint=0;
+    sub_draw(p,dst+PREFIX,w,h,scale);
+    mark_slot(dst, slot); atomic_thread_fence(memory_order_release);
+    p->submitted_cb = cb;
+    if (p->popup && !p->mapped_w) {
+        printf("POPUP %u %u %d %d %d %d\n",p->id,p->parent->id,p->popup_x,p->popup_y,
+               p->parent->geometry[0]-p->geometry[0],p->parent->geometry[1]-p->geometry[1]);
+    }
+    p->frame_scale=scale;
+    p->mapped_w=w/scale; p->mapped_h=h/scale; p->busy=1;
+    printf("PIXELS %u %u %u %d %d %d\n", p->id, ++p->seq, slot,w,h,scale); fflush(stdout);
+}
 static void shared_commit(struct wl_client *c, struct wl_resource *r) {
     (void)c;
     struct shared_surface *p = wl_resource_get_user_data(r);
-    if (!p->top) goto invalid;
+    if (p->sub_role) { sub_commit(p); return; }
+    if ((!p->top && !p->popup) || p->dismissed) return;
+    memcpy(p->geometry, p->pending_geometry, sizeof p->geometry);
     p->scale = p->pending_scale;
+    int w=p->base_w, h=p->base_h;
     if (!p->attached) {
+        int changed=p->repaint || p->cb || (p->base && p->scale!=(p->deferred ? p->deferred_scale : p->frame_scale));
+        for (int i=0;i<NSURF;i++) {
+            struct shared_surface *q=&windows[i];
+            if (q->sub_parent==p && (q->dirty || q->x!=q->next_x || q->y!=q->next_y)) changed=1;
+        }
+        if (p->base && changed) {
+            if (w%p->scale || h%p->scale || (p->deferred_cb && p->cb)) goto invalid;
+            sub_apply(p);
+            if (p->busy) {
+                p->deferred=1;
+                p->deferred_scale=p->scale;
+                if (p->cb) { p->deferred_cb=p->cb; p->cb=NULL; }
+            } else {
+                shared_publish(p,p->scale,p->cb);
+                p->cb=NULL;
+            }
+            return;
+        }
+        sub_apply(p);
         if (!p->configured && !p->serial) shared_configure(p, 0, 0);
         return;
     }
     p->attached = 0;
     if (!p->buf) {
+        free(p->base); p->base=NULL; cancel_repaint(p);
+        sub_apply(p);
         if (p->mapped_w) {
+            dismiss_children(p);
             blur(p);
+            if (p->popup) {
+                p->dismissed = 1;
+                p->parent = NULL;
+                wl_resource_post_event(p->popup,1);
+            }
             p->mapped_w = p->mapped_h = 0;
             p->resize_w = p->resize_h = 0;
             p->serial = p->configured = 0;
             if (p->cb) wl_resource_destroy(p->cb);
             if (p->submitted_cb) wl_resource_destroy(p->submitted_cb);
-            shared_event("UNMAP", p->id);
+            shared_event(p->popup ? "CLOSED" : "UNMAP", p->id);
         } else if (!p->configured && !p->serial) shared_configure(p, 0, 0);
         return;
     }
     struct wl_shm_buffer *b = wl_shm_buffer_get(p->buf);
     if (!p->configured || p->busy || !b) goto invalid;
-    int w = wl_shm_buffer_get_width(b), h = wl_shm_buffer_get_height(b), stride = wl_shm_buffer_get_stride(b);
+    w = wl_shm_buffer_get_width(b); h = wl_shm_buffer_get_height(b); int stride = wl_shm_buffer_get_stride(b);
     unsigned format = wl_shm_buffer_get_format(b);
     if ((format != WL_SHM_FORMAT_XRGB8888 && format != WL_SHM_FORMAT_ARGB8888) || w%p->scale || h%p->scale || w<1 || h<1 || w>width || h>height || stride<w*4) goto invalid;
-    unsigned slot = (unsigned)(p-windows);
-    unsigned char *dst = frame + slot*RANGE;
+    if (p->geometry[2] && (p->geometry[0]<0 || p->geometry[1]<0 ||
+        p->geometry[2]>w/p->scale || p->geometry[3]>h/p->scale ||
+        p->geometry[0]>w/p->scale-p->geometry[2] || p->geometry[1]>h/p->scale-p->geometry[3])) goto invalid;
+    if (p->popup && ((p->geometry[2] ?: w/p->scale)!=p->popup_w || (p->geometry[3] ?: h/p->scale)!=p->popup_h)) goto invalid;
+    unsigned char *base=realloc(p->base,(size_t)w*h*4);
+    if (!base) { wl_resource_post_no_memory(r); return; }
+    p->base=base; p->base_w=w; p->base_h=h;
     wl_shm_buffer_begin_access(b);
     const unsigned char *src = wl_shm_buffer_get_data(b);
-    for (int y=0; y<h; y++) memcpy(dst+PREFIX+y*w*4, src+(size_t)y*stride, w*4);
+    for (int y=0; y<h; y++) memcpy(base+y*w*4, src+(size_t)y*stride, w*4);
     wl_shm_buffer_end_access(b);
     wl_buffer_send_release(p->buf); wl_list_remove(&p->gone.link); p->buf=NULL;
-    mark_slot(dst, slot); atomic_thread_fence(memory_order_release);
-    p->submitted_cb = p->cb;
-    p->cb = NULL;
-    p->mapped_w=w/p->scale; p->mapped_h=h/p->scale; p->busy=1;
-    printf("PIXELS %u %u %u %d %d %d\n", p->id, ++p->seq, slot,w,h,p->scale); fflush(stdout);
+    sub_apply(p);
+    shared_publish(p,p->scale,p->cb);
+    p->cb=NULL;
     return;
 invalid: wl_resource_post_error(r, 0, "invalid or unpaced shared commit");
 }
@@ -222,7 +492,7 @@ static void shared_create(struct wl_client *c, struct wl_resource *r, uint32_t i
     }
     for (int i=0;i<NSURF;i++) {
         struct shared_surface *p=&windows[i];
-        if (p->s || p->xd || p->top || p->cb || p->submitted_cb || p->busy) continue;
+        if (p->s || p->sub || p->xd || p->top || p->popup || p->cb || p->submitted_cb || p->busy) continue;
         *p=(struct shared_surface){.scale=1, .pending_scale=1, .id=++next_id, .gone.notify=shared_buffer_gone};
         p->s=wl_resource_create(c,&wl_surface_interface,wl_resource_get_version(r),id);
         if (!p->s) { wl_client_post_no_memory(c); return; }
@@ -237,20 +507,43 @@ static int shared_dispatch(const void *iface, void *target, uint32_t op, const s
     if (!op) { wl_resource_destroy(r); return 0; }
     struct wl_resource **out;
     const struct wl_interface *type;
+    if (iface==&shell_base && op==1) {
+        struct positioner *q=calloc(1,sizeof *q);
+        struct wl_resource *pos=q?wl_resource_create(c,&shell_positioner,1,a[0].n):NULL;
+        if (!pos) { free(q); wl_client_post_no_memory(c); return 0; }
+        wl_resource_set_dispatcher(pos,positioner_dispatch,&shell_positioner,q,positioner_free);
+        return 0;
+    }
     if (iface==&shell_base && op==2) {
         struct wl_resource *s=(void*)a[1].o;
         p=wl_resource_get_user_data(s);
-        if (!p || p->xd) goto invalid;
+        if (!p || p->xd || p->sub_role) goto invalid;
         out=&p->xd; type=&shell_surface;
-    } else if (iface==&shell_surface && op==1 && !p->top) {
+    } else if (iface==&shell_surface && op==1 && !p->top && !p->popup && !p->dismissed) {
         out=&p->top; type=&shell_top;
+    } else if (iface==&shell_surface && op==2 && !p->top && !p->popup && !p->dismissed && a[1].o) {
+        struct shared_surface *parent=wl_resource_get_user_data((void *)a[1].o);
+        if (parent==p || !parent->s || !parent->top || !parent->mapped_w || p->seq ||
+            !placement(p,parent,wl_resource_get_user_data((void *)a[2].o))) goto invalid;
+        out=&p->popup; type=&shell_popup;
+    } else if (iface==&shell_popup && op==1) {
+        if (!p->parent || p->mapped_w || p->configured || p->serial || grab) goto invalid;
+        if (press_owner!=p->parent || a[1].u!=press_serial) {
+            p->dismissed=1; p->parent=NULL; wl_resource_post_event(r,1); return 0;
+        }
+        press_owner=NULL; grab=p; blur(p->parent);
+        fprintf(stderr,"M2_MENU_GRAB %u\n",p->id);
+        return 0;
     } else if (iface==&shell_surface && op==4 && p->serial && p->serial==a[0].u) {
         p->serial=0; p->configured=1; shared_resize(p); return 0;
-    } else if (iface==&shell_surface && op==3) return 0;
+    } else if (iface==&shell_surface && op==3 && a[2].i>0 && a[3].i>0) {
+        for (int i=0;i<4;i++) p->pending_geometry[i]=a[i].i;
+        return 0;
+    }
     else if (iface==&shell_top && (op==2 || op==3 || op==7 || op==8 || (op==1 && !a[0].o))) return 0;
     else goto invalid;
     *out=wl_resource_create(c,type,1,a[0].n);
-    if (!*out) { wl_client_post_no_memory(c); return 0; }
+    if (!*out) { p->parent=NULL; wl_client_post_no_memory(c); return 0; }
     wl_resource_set_dispatcher(*out,shared_dispatch,type,p,shared_clear);
     if (type==&shell_top) shared_event("OPEN",p->id);
     return 0;
@@ -260,7 +553,7 @@ static void shared_reset(void) {
     int abandoned = 0;
     for (int i = 0; i < NSURF; ++i) {
         struct shared_surface *p = &windows[i];
-        if (p->s || p->xd || p->top || p->cb || p->submitted_cb || p->buf) fail("live Wayland resource after teardown");
+        if (p->s || p->xd || p->top || p->popup || p->cb || p->submitted_cb || p->deferred_cb || p->sub || p->sub_parent || p->base || p->visible || p->cached || p->buf) fail("live Wayland resource after teardown");
         abandoned += p->busy;
         *p = (struct shared_surface){0};
     }
@@ -285,7 +578,7 @@ static void shared_command(void) {
         return;
     }
     if (!strcmp(ack_line,"STOP\n")) {
-        for(int i=0;i<NSURF;i++) if(windows[i].s || windows[i].busy) fail("STOP with live surface");
+        for(int i=0;i<NSURF;i++) if(windows[i].s || windows[i].sub || windows[i].busy || windows[i].deferred) fail("STOP with live surface");
         wl_display_terminate(display); return;
     }
     if(sscanf(ack_line,"ACK %u %u%n",&id,&seq,&end)!=2 || strcmp(ack_line+end,"\n")) fail("bad shared ACK");
@@ -297,6 +590,12 @@ static void shared_command(void) {
         if (p->submitted_cb) {
             wl_callback_send_done(p->submitted_cb, (uint32_t)(monotonic_ns()/1000000));
             wl_resource_destroy(p->submitted_cb);
+        }
+        if (p->deferred) {
+            p->deferred=0;
+            struct wl_resource *cb=p->deferred_cb;
+            p->deferred_cb=NULL;
+            shared_publish(p,p->deferred_scale,cb);
         }
         shared_resize(p);
         return;

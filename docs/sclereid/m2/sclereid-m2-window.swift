@@ -72,6 +72,14 @@ private final class WindowEvents: NSObject, NSWindowDelegate {
         }
     }
 
+    func windowDidChangeBackingProperties(_ notification: Notification) {
+        guard let w = notification.object as? NSWindow, let layer = w.contentView?.layer else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.contentsScale = w.backingScaleFactor
+        CATransaction.commit()
+    }
+
     func windowDidResignKey(_ notification: Notification) {
         ((notification.object as? NSWindow)?.contentView as? SeatView)?.input("L 0")
     }
@@ -114,10 +122,17 @@ private func makeImage(_ frame: Data, width: Int, height: Int) -> CGImage {
     return image
 }
 
+private let popupOrigin: NSPoint? = {
+    guard let raw = ProcessInfo.processInfo.environment["M2_POPUP_ORIGIN"] else { return nil }
+    let fields = raw.split(separator: " ").compactMap { Int($0) }
+    guard fields.count == 2 else { fail("invalid popup origin") }
+    return NSPoint(x: fields[0], y: fields[1])
+}()
+
 private func openWindow(_ view: NSView, interactive: Bool = false) -> NSWindow {
-    let style: NSWindow.StyleMask = interactive ? [.titled, .closable, .resizable] : [.titled]
+    let style: NSWindow.StyleMask = popupOrigin != nil ? [.borderless] : interactive ? [.titled, .closable, .resizable] : [.titled]
     let w = NSWindow(contentRect: view.bounds, styleMask: style, backing: .buffered, defer: false)
-    if interactive {
+    if interactive && popupOrigin == nil {
         let events = WindowEvents()
         windowEvents = events
         w.delegate = events
@@ -129,7 +144,8 @@ private func openWindow(_ view: NSView, interactive: Bool = false) -> NSWindow {
     w.title = "Sclereid M2"
     w.contentView = view
     window = w
-    w.center()
+    if let popupOrigin { w.setFrameOrigin(popupOrigin); w.level = .floating }
+    else { w.center() }
     w.orderFrontRegardless()
     w.display()
     return w
@@ -141,6 +157,11 @@ private func show(_ frame: Data) {
     view.verify()
     guard w.isVisible, onScreen(w.windowNumber) else { fail("window is not ordered on screen") }
     if CommandLine.arguments.contains("--retina") {
+        if let popupOrigin {
+            let rect = w.convertToScreen(view.convert(view.bounds, to: nil))
+            guard rect.origin == popupOrigin else { fail("popup origin mismatch") }
+            report("POPUP_ORIGIN \(Int(rect.minX)) \(Int(rect.minY))")
+        }
         let backing = view.convertToBacking(view.bounds).size
         guard view.bounds.size == NSSize(width: 32, height: 24), backing.width == 32 * w.backingScaleFactor, backing.height == 24 * w.backingScaleFactor else { fail("unexpected Retina geometry: \(view.bounds.size), \(backing)") }
         report("RETINA_OK logical=32x24 backing=\(Int(backing.width))x\(Int(backing.height)) buffer=64x48")
@@ -164,6 +185,14 @@ private final class SeatView: NSView {
     override func mouseDragged(with event: NSEvent) { mouseMoved(with: event) }
     override func mouseDown(with event: NSEvent) { mouseMoved(with: event); input("B 1") }
     override func mouseUp(with event: NSEvent) { input("B 0") }
+    override func rightMouseDown(with event: NSEvent) { mouseMoved(with: event); input("B 1 1") }
+    override func rightMouseUp(with event: NSEvent) { input("B 0 1") }
+    override func rightMouseDragged(with event: NSEvent) { mouseMoved(with: event) }
+    override func scrollWheel(with event: NSEvent) {
+        for (axis,delta) in [event.scrollingDeltaY,event.scrollingDeltaX].enumerated() where delta != 0 {
+            input("W \(axis) \(Int(delta > 0 ? -max(1,min(120,delta * 10)) : max(1,min(120,-delta * 10))))")
+        }
+    }
     private let codes: [UInt16: Int] = [0:30,1:31,2:32,3:33,4:35,5:34,6:44,7:45,8:46,9:47,
         11:48,12:16,13:17,14:18,15:19,16:21,17:20,31:24,32:22,34:23,35:25,36:28,
         37:38,38:36,40:37,45:49,46:50,48:15,49:57,51:14,53:1,123:105,124:106,125:108,126:103]
@@ -177,6 +206,47 @@ private final class SeatView: NSView {
         if let code = codes[event.keyCode] { input("K \(code) 0") }
     }
 }
+
+private func setFrame(_ image: CGImage, on layer: CALayer, backingScale: CGFloat) {
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    layer.contentsScale = backingScale
+    layer.contentsGravity = .resize
+    layer.minificationFilter = .nearest
+    layer.magnificationFilter = .nearest
+    layer.contents = image
+    CATransaction.commit()
+}
+
+private func verifyOffscreen2x(_ frame: Data, image: CGImage, bounds: CGRect, scale: Int) {
+    let layer = CALayer()
+    layer.bounds = bounds
+    setFrame(image, on: layer, backingScale: 2)
+    let w = Int(bounds.width * 2), h = Int(bounds.height * 2)
+    let format = CGBitmapInfo.byteOrder32Little.union(CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue))
+    guard let context = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: image.colorSpace!, bitmapInfo: format.rawValue),
+          let output = context.data else { fail("no offscreen bitmap") }
+    context.interpolationQuality = .none
+    context.scaleBy(x: 2, y: 2)
+    layer.render(in: context)
+    let actual = UnsafeRawBufferPointer(start: output, count: w * h * 4)
+    let repeatCount = 2 / scale
+    frame.withUnsafeBytes { (expected: UnsafeRawBufferPointer) in
+        for y in 0..<h {
+            for x in 0..<w {
+                let dst = (y * w + x) * 4
+                let src = ((y / repeatCount) * image.width + x / repeatCount) * 4
+                guard actual[dst..<(dst + 4)].elementsEqual(expected[src..<(src + 4)]) else {
+                    fail("offscreen 2x mismatch at (\(x), \(y)): \(Array(actual[dst..<(dst + 4)])) != \(Array(expected[src..<(src + 4)]))")
+                }
+            }
+        }
+    }
+    report("OFFSCREEN_2X_OK \(w)x\(h) exact_pixels=\(w * h) repeat=\(repeatCount)")
+}
+
+private let verifyPixels = ProcessInfo.processInfo.environment["M2_VERIFY_PIXELS"] == "1"
 
 private func animate(_ frame: Data, width: Int, height: Int, interactive: Bool = false, scale: Int = 1) {
     let first = window == nil
@@ -201,11 +271,7 @@ private func animate(_ frame: Data, width: Int, height: Int, interactive: Bool =
     let start = CACurrentMediaTime()
     let image = makeImage(frame, width: width, height: height)
     let constructed = CACurrentMediaTime()
-    CATransaction.begin()
-    CATransaction.setDisableActions(true)
-    layer.contentsScale = CGFloat(scale)
-    layer.contents = image
-    CATransaction.commit()
+    setFrame(image, on: layer, backingScale: w.backingScaleFactor)
     // This measures submission, not when the frame reaches the display.
     CATransaction.flush()
     let applied = CACurrentMediaTime()
@@ -217,8 +283,21 @@ private func animate(_ frame: Data, width: Int, height: Int, interactive: Bool =
             guard w.isVisible, onScreen(w.windowNumber) else { fail("remapped window is not on screen") }
             report("REMAPPED")
         }
+        if let popupOrigin {
+            let rect = w.convertToScreen(view.convert(view.bounds, to: nil))
+            guard rect.origin == popupOrigin else { fail("popup origin mismatch") }
+            report("POPUP_ORIGIN \(Int(rect.minX)) \(Int(rect.minY))")
+        }
         let backing = view.convertToBacking(view.bounds)
         report("GEOMETRY \(Int(view.bounds.width)) \(Int(view.bounds.height)) backing \(Int(backing.width)) \(Int(backing.height))")
+        if verifyPixels {
+            guard layer.bounds.size == view.bounds.size, layer.contentsScale == w.backingScaleFactor,
+                  layer.minificationFilter == .nearest, layer.magnificationFilter == .nearest else {
+                fail("unexpected live layer configuration")
+            }
+            report("LAYER_OK contents_scale=\(Int(layer.contentsScale)) buffer_scale=\(scale) filter=nearest")
+            verifyOffscreen2x(frame, image: image, bounds: layer.bounds, scale: scale)
+        }
     }
     windowEvents?.flush()
     report(String(format: "FRAME_OK %.6f %.6f", (constructed - start) * 1000, (applied - constructed) * 1000))
@@ -268,9 +347,13 @@ private func receiveXDG() {
                 guard let window, let events = windowEvents else { fail("window command before first frame") }
                 if h == 1 { window.setContentSize(NSSize(width: 320, height: 280)) }
                 else if h == 2 { window.performClose(nil) }
-                else if h == 3, window.contentView is SeatView {
-                    for type: NSEvent.EventType in [.leftMouseDown, .leftMouseUp] {
+                else if (h == 3 || h == 6), let seat = window.contentView as? SeatView {
+                    for type: NSEvent.EventType in (h == 6 ? [.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp] : [.leftMouseDown, .leftMouseUp]) {
                         window.sendEvent(NSEvent.mouseEvent(with: type, location: NSPoint(x: 11, y: window.contentView!.bounds.height - 8), modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
+                    }
+                    if h == 6 {
+                        let wheel = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 1, wheel1: -1, wheel2: 0, wheel3: 0)!
+                        seat.scrollWheel(with: NSEvent(cgEvent: wheel)!)
                     }
                     func shift(_ flags: NSEvent.ModifierFlags) {
                         window.sendEvent(NSEvent.keyEvent(with: .flagsChanged, location: .zero, modifierFlags: flags, timestamp: 0, windowNumber: window.windowNumber, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 56)!)
@@ -287,6 +370,13 @@ private func receiveXDG() {
                     guard !window.isVisible, !onScreen(id) else { fail("unmapped window is still on screen") }
                 } else if h == 5, window.contentView is SeatView {
                     window.setContentSize(NSSize(width: 160, height: 120))
+                } else if h == 7, window.contentView is SeatView {
+                    for (width, height) in [(170, 130), (180, 140), (192, 144)] {
+                        window.setContentSize(NSSize(width: width, height: height))
+                    }
+                } else if h == 8, let view = window.contentView {
+                    let rect = window.convertToScreen(view.convert(view.bounds, to: nil))
+                    report("CONTENT_ORIGIN \(Int(rect.minX)) \(Int(rect.maxY))")
                 } else { fail("unknown window command") }
                 events.flush()
                 report("COMMAND_OK")

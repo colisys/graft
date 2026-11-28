@@ -22,7 +22,7 @@
 
 ## M2 进展：单窗与单 VM 多窗
 
-[复现与结果](m2/m2-smoke.md)：Linux Wayland SHM → DAX → macOS AppKit。已验证固定图案、[连续动画](m2/m2-smoke.md#动画基准)和[原版 Weston 客户端](m2/m2-smoke.md#真实客户端weston-simple-shm)的 `xdg-shell` 配置、resize 与原生关闭回程；[异常断链](m2/m2-smoke.md#异常断链)已覆盖 VM 突然退出后的窗口回收。[单 VM 多窗](m2/m2-smoke.md#单-vm-多窗)的 1–8 窗测试中，每窗平均提交率从 59.60 降至 58.75 FPS。[共享窗口生命周期](m2/m2-smoke.md#共享窗口resizeunmapremap)已实测 AppKit resize 回程、显式 NULL attach 隐藏与同 surface remap；尚未验证共享模式的 GTK/Qt/Electron。下一步补窗口协议兼容，再微调槽深和节拍。默认显示后端仍是 XQuartz。
+[复现与结果](m2/m2-smoke.md)：Linux Wayland SHM → DAX → macOS AppKit。已验证固定图案、[连续动画](m2/m2-smoke.md#动画基准)和[原版 Weston 客户端](m2/m2-smoke.md#真实客户端weston-simple-shm)的 `xdg-shell` 配置、resize 与原生关闭回程；[异常断链](m2/m2-smoke.md#异常断链)已覆盖 VM 突然退出后的窗口回收。[单 VM 多窗](m2/m2-smoke.md#单-vm-多窗)的 1–8 窗测试中，每窗平均提交率从 59.60 降至 58.75 FPS。[共享窗口生命周期](m2/m2-smoke.md#共享窗口resizeunmapremap)已实测 AppKit resize 回程、显式 NULL attach 隐藏与同 surface remap；共享模式已验收 GTK 双窗及有在途帧时的 resize 合并；[无 grab 的单层 popup](m2/m2-smoke.md#bounded-xdg-popup-intel-hvf)已验证父窗口相对几何和父窗口 unmap 时回收；[同步 subsurface](m2/m2-smoke.md#synchronized-direct-subsurface-intel-hvf) 已验证无新父缓冲时单层不透明子表面的合成、移动裁切、更新与销毁后重绘；[GTK 单层菜单](m2/m2-smoke.md#gtk-menu-closeout-checkpoint)已验证 grab、原生菜单帧和父窗外部点击回收；层叠、Qt、Electron、通用 popup/subsurface 和物理拖动仍待验收。见 [M2 剩余验收](m2/m2-smoke.md#remaining-m2-acceptance)。下一步补窗口协议兼容，再微调槽深和节拍。默认显示后端仍是 XQuartz。
 
 ## 性能测量
 

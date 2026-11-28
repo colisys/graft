@@ -437,6 +437,7 @@ static int server(const char *socket_name) {
     wl_list_init(&devices);
     if(shared && !wl_global_create(display,&wl_output_interface,2,NULL,bind_output)) fail("creating output");
     if(shared && !wl_global_create(display,&wl_data_device_manager_interface,1,NULL,bind_data_manager)) fail("creating data device manager");
+    if(shared && !wl_global_create(display,&wl_subcompositor_interface,1,NULL,bind_sub)) fail("creating subcompositor");
     if(shared && !wl_global_create(display,&wl_seat_interface,2,NULL,bind_seat)) fail("creating seat");
     struct wl_listener created = { .notify = client_created };
     struct wl_event_source *acks = NULL;
@@ -493,6 +494,7 @@ static int output_event(const void *impl,void *target,uint32_t op,const struct w
     return 0;
 }
 static struct wl_seat *fixture_seat;
+static struct wl_subcompositor *fixture_sub;
 static struct wl_surface *fixture_windows[2];
 static int fixture_input(const void *impl,void *target,uint32_t op,const struct wl_message *msg,union wl_argument *a) {
     (void)target;(void)op;
@@ -551,6 +553,46 @@ static struct wl_buffer *fixture_buffer(int w, int h) {
     wl_shm_pool_destroy(pool);
     return buffer;
 }
+static void popup_size(void *data, struct wl_proxy *popup, int x, int y, int w, int h) {
+    (void)data; (void)popup;
+    if (x!=9 || y!=7 || w!=16 || h!=12) fail("popup configure geometry");
+}
+static void popup_done(void *data, struct wl_proxy *popup) {
+    (void)popup; *(int *)data=1;
+}
+static void fixture_popup(struct wl_proxy *parent, struct wl_surface *parent_surface, struct fixture_role *parent_state) {
+    struct fixture_role state={0};
+    int dismissed=0;
+    static void (*configure[])(void)={(void(*)(void))fixture_configure};
+    static void (*events[])(void)={(void(*)(void))popup_size,(void(*)(void))popup_done};
+    struct wl_proxy *pos=wl_proxy_marshal_constructor(fixture_base,1,&shell_positioner,NULL);
+    wl_proxy_marshal(pos,1,16,12);
+    wl_proxy_marshal(pos,2,3,4,8,6);
+    wl_proxy_marshal(pos,3,8);
+    wl_proxy_marshal(pos,4,4);
+    wl_proxy_marshal(pos,6,-2,3);
+    struct wl_surface *surface=wl_compositor_create_surface(compositor);
+    wl_surface_set_buffer_scale(surface,output_scale);
+    struct wl_proxy *role=wl_proxy_marshal_constructor(fixture_base,2,&shell_surface,NULL,surface);
+    struct wl_proxy *popup=wl_proxy_marshal_constructor(role,2,&shell_popup,NULL,parent,pos);
+    wl_proxy_marshal(pos,6,1000,1000);
+    wl_proxy_marshal(pos,0); wl_proxy_destroy(pos);
+    wl_proxy_add_listener(role,configure,&state);
+    wl_proxy_add_listener(popup,events,&dismissed);
+    wl_surface_commit(surface);
+    while (!state.ready) if (wl_display_dispatch(display)<0) fail("popup configure");
+    struct wl_buffer *buffer=fixture_buffer(16*output_scale,12*output_scale);
+    wl_surface_attach(surface,buffer,0,0); wl_surface_commit(surface);
+    while (!parent_state->closed) if (wl_display_dispatch(display)<0) fail("popup submit");
+    parent_state->closed=0;
+    wl_surface_attach(parent_surface,NULL,0,0); wl_surface_commit(parent_surface);
+    while (!dismissed) if (wl_display_dispatch(display)<0) fail("popup done");
+    wl_proxy_marshal(popup,0); wl_proxy_destroy(popup);
+    wl_proxy_marshal(role,0); wl_proxy_destroy(role);
+    wl_surface_destroy(surface); wl_buffer_destroy(buffer);
+    wl_proxy_marshal(parent,3,0,0,64/output_scale,48/output_scale);
+    fprintf(stderr,"FIXTURE_POPUP_DONE\n");
+}
 static int fixture(struct wl_buffer *b) {
     int count=getenv("M2_VICTIM") ? 2 : 1, done=0;
     struct fixture_role state[2] = {0};
@@ -582,31 +624,88 @@ static int fixture(struct wl_buffer *b) {
     while(!done) if(wl_display_dispatch(display)<0) fail("fixture second frame");
     while(state[0].ready<2) if(wl_display_dispatch(display)<0) fail("fixture resize configure");
     if(state[0].w!=160 || state[0].h!=120) fail("fixture resize dimensions");
-    struct wl_buffer *resized = fixture_buffer(state[0].w*output_scale, state[0].h*output_scale);
+    for (int step=0; step<2; step++) {
+        struct wl_buffer *resized = fixture_buffer(state[0].w*output_scale, state[0].h*output_scale);
+        done=0; wl_callback_add_listener(wl_surface_frame(s[0]),&cb_ops,&done);
+        wl_surface_attach(s[0],resized,0,0); wl_surface_commit(s[0]);
+        while(!done) if(wl_display_dispatch(display)<0) fail("fixture resized frame");
+        wl_buffer_destroy(resized);
+        if (!step) {
+            while(state[0].ready<3) if(wl_display_dispatch(display)<0) fail("fixture burst configure");
+            if(state[0].ready!=3 || state[0].w!=192 || state[0].h!=144) fail("fixture burst dimensions");
+        }
+    }
+    if (!fixture_sub) fail("missing subcompositor");
+    struct wl_surface *child=wl_compositor_create_surface(compositor);
+    struct wl_subsurface *sub=wl_subcompositor_get_subsurface(fixture_sub,child,s[0]);
+    struct wl_buffer *overlay=fixture_buffer(8,6);
+    wl_subsurface_set_position(sub,3,5);
+    wl_surface_attach(child,overlay,0,0); wl_surface_commit(child);
+    if (wl_display_roundtrip(display)<0) fail("cached child commit");
+    wl_buffer_destroy(overlay);
     done=0; wl_callback_add_listener(wl_surface_frame(s[0]),&cb_ops,&done);
-    wl_surface_attach(s[0],resized,0,0); wl_surface_commit(s[0]);
-    while(!done) if(wl_display_dispatch(display)<0) fail("fixture resized frame");
-    wl_buffer_destroy(resized);
     wl_surface_commit(s[0]);
-    wl_surface_attach(s[0],NULL,0,0); wl_surface_commit(s[0]);
-    if(wl_display_roundtrip(display)<0 || state[0].ready!=2) fail("fixture unmap reset");
+    if (wl_display_roundtrip(display)<0 || done) fail("first retained frame was not held");
+    wl_subsurface_set_position(sub,12,10);
     wl_surface_commit(s[0]);
-    while(state[0].ready<3) if(wl_display_dispatch(display)<0) fail("fixture remap configure");
+    wl_subsurface_set_position(sub,-2,8);
+    overlay=fixture_buffer(6,4);
+    wl_surface_attach(child,overlay,0,0); wl_surface_commit(child);
+    if (wl_display_roundtrip(display)<0) fail("updated child commit");
+    wl_buffer_destroy(overlay);
+    int deferred_done=0;
+    wl_callback_add_listener(wl_surface_frame(s[0]),&cb_ops,&deferred_done);
+    wl_surface_commit(s[0]);
+    wl_subsurface_set_position(sub,19,13);
+    overlay=fixture_buffer(4,4);
+    wl_surface_attach(child,overlay,0,0); wl_surface_commit(child);
+    if (wl_display_roundtrip(display)<0 || done || deferred_done) fail("retained repaint acknowledged early");
+    wl_buffer_destroy(overlay);
+    fprintf(stderr,"FIXTURE_REPAINT_QUEUED\n");
+    while(!done || !deferred_done) if(wl_display_dispatch(display)<0) fail("deferred subsurface parent frame");
+    wl_surface_destroy(child); wl_subsurface_destroy(sub);
+    done=0; wl_callback_add_listener(wl_surface_frame(s[0]),&cb_ops,&done);
+    wl_surface_commit(s[0]);
+    while(!done) if(wl_display_dispatch(display)<0) fail("subsurface removal frame");
+    wl_proxy_marshal(roles[0],3,2,3,190,141);
+    wl_surface_commit(s[0]);
+    fixture_popup(roles[0],s[0],&state[0]);
+    if(wl_display_roundtrip(display)<0 || state[0].ready!=3) fail("fixture unmap reset");
+    wl_surface_commit(s[0]);
+    while(state[0].ready<4) if(wl_display_dispatch(display)<0) fail("fixture remap configure");
     if(state[0].w || state[0].h) fail("fixture remap dimensions");
     wl_surface_set_buffer_scale(s[0],output_scale);
-    done=0; wl_callback_add_listener(wl_surface_frame(s[0]),&cb_ops,&done);
+    done=0; struct wl_callback *remapped=wl_surface_frame(s[0]);
+    wl_callback_add_listener(remapped,&cb_ops,&done);
     wl_surface_attach(s[0],b,0,0); wl_surface_commit(s[0]);
-    while(!done) if(wl_display_dispatch(display)<0) fail("fixture remapped frame");
+    child=wl_compositor_create_surface(compositor);
+    sub=wl_subcompositor_get_subsurface(fixture_sub,child,s[0]);
+    overlay=fixture_buffer(8,6);
+    wl_surface_attach(child,overlay,0,0); wl_surface_commit(child);
+    deferred_done=0;
+    struct wl_callback *discarded=wl_surface_frame(s[0]);
+    wl_callback_add_listener(discarded,&cb_ops,&deferred_done);
+    wl_surface_commit(s[0]);
+    if (wl_display_roundtrip(display)<0 || done || deferred_done) fail("teardown repaint not held");
+    fprintf(stderr,"FIXTURE_TEARDOWN_QUEUED\n");
     while(!state[0].closed) if(wl_display_dispatch(display)<0) fail("fixture close");
     wl_proxy_marshal(tops[0],0); wl_proxy_marshal(roles[0],0);
     if(wl_display_roundtrip(display)<0) fail("fixture focus teardown");
     wl_surface_destroy(s[0]);
-    if(wl_display_roundtrip(display)<0) fail("fixture teardown");
+    if(wl_display_roundtrip(display)<0 || done || deferred_done) fail("fixture parent teardown");
+    wl_subsurface_set_position(sub,5,7);
+    wl_surface_attach(child,overlay,0,0); wl_surface_commit(child);
+    if(wl_display_roundtrip(display)<0) fail("fixture inert child commit");
+    wl_subsurface_destroy(sub); wl_surface_destroy(child); wl_buffer_destroy(overlay);
+    wl_callback_destroy(discarded); wl_callback_destroy(remapped);
+    if(wl_display_roundtrip(display)<0 || done || deferred_done) fail("fixture child teardown");
+    fprintf(stderr,"FIXTURE_PARENT_FIRST_DONE\n");
     wl_display_disconnect(display); return 0;
 }
 static void global(void *data, struct wl_registry *r, uint32_t name, const char *iface, uint32_t version) {
     (void)data; (void)version;
     if(shared && !strcmp(iface,"wl_output")) wl_proxy_add_dispatcher(wl_registry_bind(r,name,&wl_output_interface,2),output_event,NULL,NULL);
+    if(shared && !strcmp(iface,"wl_subcompositor")) fixture_sub=wl_registry_bind(r,name,&wl_subcompositor_interface,1);
     if(shared && !strcmp(iface,"wl_seat")) fixture_seat=wl_registry_bind(r,name,&wl_seat_interface,1);
     if(shared && !strcmp(iface,shell_base.name)) fixture_base=wl_registry_bind(r,name,&shell_base,1);
     if (!strcmp(iface, wl_shm_interface.name)) shm = wl_registry_bind(r, name, &wl_shm_interface, 1);

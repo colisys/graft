@@ -6,8 +6,16 @@
 #include <wayland-server.h>
 
 static const struct wl_interface shell_surface, shell_top;
-static const struct wl_interface shell_positioner = { .name = "xdg_positioner", .version = 1 };
-static const struct wl_interface shell_popup = { .name = "xdg_popup", .version = 1 };
+static const struct wl_interface shell_positioner, shell_popup;
+static const struct wl_message positioner_requests[] = {
+    {"destroy", "", NULL}, {"set_size", "ii", NULL}, {"set_anchor_rect", "iiii", NULL},
+    {"set_anchor", "u", NULL}, {"set_gravity", "u", NULL},
+    {"set_constraint_adjustment", "u", NULL}, {"set_offset", "ii", NULL}
+};
+static const struct wl_message popup_requests[] = {
+    {"destroy", "", NULL}, {"grab", "ou", (const struct wl_interface *[]){ &wl_seat_interface, NULL }}
+};
+static const struct wl_message popup_events[] = { {"configure", "iiii", NULL}, {"popup_done", "", NULL} };
 static const struct wl_interface *positioner_types[] = { &shell_positioner };
 static const struct wl_interface *surface_types[] = { &shell_surface, &wl_surface_interface };
 static const struct wl_interface *top_types[] = { &shell_top };
@@ -37,5 +45,7 @@ static const struct wl_message top_events[] = { {"configure", "iia", NULL}, {"cl
 static const struct wl_interface shell_base = SHELL_INTERFACE("xdg_wm_base", shell_requests, shell_events);
 static const struct wl_interface shell_surface = SHELL_INTERFACE("xdg_surface", surface_requests, surface_events);
 static const struct wl_interface shell_top = SHELL_INTERFACE("xdg_toplevel", top_requests, top_events);
+static const struct wl_interface shell_positioner = { "xdg_positioner", 1, 7, positioner_requests, 0, NULL };
+static const struct wl_interface shell_popup = SHELL_INTERFACE("xdg_popup", popup_requests, popup_events);
 #undef SHELL_INTERFACE
 #endif

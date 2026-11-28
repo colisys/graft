@@ -23,7 +23,7 @@ python3 docs/sclereid/m2/sclereid-m2.py "$iso" --weston
 python3 docs/sclereid/m2/sclereid-m2.py "$iso" --animate
 ```
 
-脚本在宿主下载并校验固定版本的 APK；`--apks DIR` 改用缓存，仍做摘要校验。来宾无网卡，桥和动态库经只读 `fw_cfg` 载入。桥用 `statx` 确认 inode DAX；宿主只读映射临时 pmem 文件，帧通知与回执走 virtio-serial。
+脚本在宿主下载并校验固定版本的 APK；`--apks DIR` 改用缓存，仍做摘要校验。来宾无网卡，主 smoke 的桥和动态库经只读 virtio-blk 载入（独立 scale benchmark 仍使用 `fw_cfg`）。桥用 `statx` 确认 inode DAX；宿主只读映射临时 pmem 文件，帧通知与回执走 virtio-serial。
 
 默认模式是无 `xdg-shell` 的单帧夹具：宿主逐字节校验图案，在 WindowServer 屏上窗口列表确认窗口，并检查视图快照的源像素颜色。
 
@@ -194,3 +194,101 @@ python3 docs/sclereid/m2/sclereid-m2.py "$iso" --gtk --apks "$cache"
 Intel HVF 实测一个 GTK 进程同时建立两窗：surface `65539` / 槽 `2` 为 128×96，surface `65540` / 槽 `3` 为 160×96，均为 1× backing。两个首帧通过 DAX 非空检查、AppKit 几何与图层提交检查。确认 GTK 仍存活后以 SIGTERM 清理，验证两窗退出、Wayland socket/锁删除、帧端口 EOF 和 VM 正常退出；输出 `GTK_OK`、`SCLEREID_M2_OK`。不覆盖 GTK 输入、resize、popup、多帧或原生 Retina。
 
 同主机 `--shared --disconnect` 回归通过断链、旧消息拒绝、输入、resize、unmap/remap、关闭与重连；`swift test` 89 项通过。
+
+### GTK input and native resize (Intel HVF, 1×)
+
+```
+python3 docs/sclereid/m2/sclereid-m2.py "$COMMANDCODE_SCRATCHPAD/alpine.iso" --gtk --apks "$COMMANDCODE_SCRATCHPAD/apks"
+swift test
+git diff --check
+```
+
+Live result: `GTK_INPUT_OK A 65539`, `GTK_INPUT_OK B 65540`, `GTK_RESIZE_OK 65539`, `GTK_OK`, `SCLEREID_M2_OK`. GTK widget signals identified the receiving window for left and right button press/release, a vertical scroll event, and Shift+A press/release (keysym 65 with Shift set). Native `setContentSize` on A produced a second 160×120 GTK SHM frame in host DAX, submitted to the AppKit layer; B's 160×96 first frame remained unacknowledged during resize. This tests scripted NSEvents and layer submission, not physical input, display scanout, IME or continuous drag. The scroll stimulus was a synthetic Core Graphics wheel event passed to the target AppKit scroll handler; the assertion checks GTK event type and target, not scroll distance. Swift: 89 passed. No Colima.
+
+### GTK frame-clock animation and per-window native close (Intel HVF, 1×)
+
+Run the GTK command above; use `--shared` in place of `--gtk` for the fixture regression. Each GTK tick advances a window-local green channel; A has a red base and B a blue base. After input and resize, the smoke checked three different same-size DAX frames for each window, including its color identity, geometry and AppKit submission. `performClose(nil)` on A produced `GTK_DELETE A`, `CLOSED 65539`, and native cleanup (not visible and absent from WindowServer). Only then were five more B frames released and submitted. Their SHA-256 prefixes in order were `86a72269`, `4e03e58b`, `391dd53d`, `ea5b9362`, `47bf8132`. B (65540) still accepted buttons, scroll and Shift+A before its own native close. Both GTK and shared runs reached `SCLEREID_M2_OK`. GTK exited normally, with server/socket cleanup, port EOF and VM exit checked.
+
+An initial run passed both close checks but timed out waiting for the GTK process exit marker. The passing run records successful client return in the guest before the background job exits. This is a bounded, ACK-paced test of layer submissions, not a refresh-rate, physical-click, Retina or scanout test.
+
+### Retina backing and exact offscreen pixels
+
+The shared window now takes `CALayer.contentsScale` from the actual `NSWindow.backingScaleFactor`, independently of the Wayland buffer scale. It uses nearest-neighbor minification and magnification. The shared fixture checks live layer configuration and renders the same image through the same layer setup into an sRGB bitmap at 2×, comparing every BGRA byte. This is not a WindowServer capture or display scanout measurement.
+
+On MacBookPro9,2 (Intel i5-3210M, macOS 13.7.8), AppKit reported 1× backing on the built-in 1280×800 display. A host-only run through the shared frame receiver used an asymmetric one-pixel pattern: buffer scale 2 matched all 3,072 pixels at 64×48 (1:1); buffer scale 1 matched all 12,288 pixels at 128×96 (each source pixel repeated 2×2). Both windows reported `CLEANUP_OK`.
+
+Reproduce from the repository root with the pinned Alpine standard 3.22.2 x86_64 ISO (see above):
+
+```sh
+python3 docs/sclereid/m2/sclereid-m2.py "$iso" --shared --output-scale 2
+python3 docs/sclereid/m2/sclereid-m2.py "$iso" --shared
+```
+
+Both commands reached `SCLEREID_M2_OK` on the MacBookPro9,2 above with QEMU 11.1.2/HVF. The built-in Color LCD was the main display: 1280×800 physical pixels and 1280×800 UI resolution. The controlled run reported `OUTPUT_SCALE native=1 advertised=2 source=override`; the default run reported `native=1 advertised=1 source=backing`. Both passed input, resize, unmap/remap, close and shutdown. The controlled run verified these offscreen BGRA results:
+
+| Frame | Buffer scale | 2× bitmap | Exact pixels | Mapping |
+|---|---:|---:|---:|---|
+| Initial scale-2 window | 2 | 64×48 | 3,072 | 1:1 |
+| Initial scale-1 window | 1 | 128×96 | 12,288 | 2×2 repetition |
+| Resized survivor | 2 | 320×240 | 76,800 | 1:1 |
+
+The prior failures stopped before `GUEST_READY`, with one last seen at ext4 superblock completion. The original fw_cfg path also passed on rerun, so the intermittent failure is not attributable to mkfs, mount, fw_cfg or HVF itself from these observations. The main harness now checks separate module, format, mount and payload stages (`M2_MODULES_READY`, `M2_FORMATTED`, `M2_MOUNTED`, `GUEST_READY`), with bounded waits, and uses the read-only virtio-blk payload path already used by GTK. The staged controlled 2× run passed twice.
+
+This supports controlled 2× end-to-end behavior and exact offscreen pixels, not native Retina presentation. On an Intel Retina desktop, omit `--output-scale` and require `OUTPUT_SCALE native=2 advertised=2 source=backing` and `LAYER_OK contents_scale=2`; offscreen comparison still does not prove native screen pixels. The prior arm64 AppKit helper build does not establish Apple Silicon VM reproduction: the harness still pins x86_64 guest inputs and Q35/HVF.
+
+`swift test`: 89 passed. AppKit helper type-check with warnings as errors, Python byte compilation, Ruff F checks and `git diff --check` passed. Pyright 1.1.408 on `sclereid-m2.py`: 0 errors (27 on both the starting dirty harness and the HEAD baseline, from existing subprocess pipe typing and optional animation timing).
+
+### Resize burst under backpressure (Intel HVF)
+
+```sh
+python3 docs/sclereid/m2/sclereid-m2.py "$iso" --shared --disconnect --output-scale 2 --apks "$cache"
+```
+
+On macOS 13.7.8 / QEMU 11.1.2 HVF, the reconnected session held surface `131075`'s `160×120` frame unacknowledged while AppKit applied `170×130`, `180×140`, then `192×144`. The harness waited for the guest to report all three queued events before releasing the slot. The fixture required one new XDG configure at the last size, and the host checked the next frame's sequence, same DAX slot, all `384×288` BGRA pixels, AppKit logical/backing size `192×144`, and layer submission. Output: `RESIZE_BURST_OK`, `UNMAP_OK`, `REMAP_OK`, `CLOSE_OK`, `SHARED_OK`, `RECONNECT_OK`, `SCLEREID_M2_OK`; the same run also passed `ABRUPT_OK`, `STALE_OK`, `SEAT_OK`, and `RESIZE_OK`. `swift test`: 89 passed; Python byte compilation and `git diff --check` passed. Native backing was 1×; 2× was advertised to the guest only.
+
+### Bounded XDG popup (Intel HVF)
+
+```sh
+python3 docs/sclereid/m2/sclereid-m2.py "$iso" --shared --disconnect --output-scale 2 --apks "$cache"
+```
+
+On macOS 13.7.8 / QEMU 11.1.2 HVF, the reconnected session mapped ungrabbed popup `131076` over toplevel `131075`. The fixture set parent window geometry `(2,3,190,141)` in surface coordinates and requested a `16×12` popup with bottom-right anchor, right gravity, and offset `(-2,3)`. It changed and destroyed the positioner before the initial surface commit and checked that configure still gave `(9,7,16,12)` relative to the parent's window geometry. The host verified all 3,072 DAX bytes of the `32×24` buffer, AppKit layer submission and native origin `(635,557)` from the parent's content origin. Backing was 1×; the guest was told 2×. The offscreen check matched all 768 pixels.
+
+While the popup's slot was still unacknowledged, the fixture unmapped the parent in response to a scripted native close request. The guest received `popup_done`, the popup was removed from the WindowServer list, and the host then acknowledged its frame. The parent remapped on its original slot and accepted input before final close. The run reached `POPUP_OK`, `ABRUPT_OK`, `STALE_OK`, `SEAT_OK`, `RESIZE_BURST_OK`, `UNMAP_OK`, `REMAP_OK`, `CLOSE_OK`, `SHARED_OK`, `RECONNECT_OK`, and `SCLEREID_M2_OK`. An earlier run stopped at the host slot-uniqueness assertion because it still tracked a closed, acknowledged victim window; the final run permits reuse only after that window closes and is acknowledged. Swift tests: 89 passed; AppKit type-check, Python byte compilation, and `git diff --check` passed.
+
+This is a fixed-position, direct-toplevel-child fixture, not GTK popup acceptance. The native popup is a separate borderless window placed once, not an attached AppKit child window that follows parent movement. Popup buffers must match configured logical dimensions and have no window-geometry inset. Grab and outside-click dismissal, nested popups, dynamic positioning, constraint adjustment and general popup input remain unverified or unsupported.
+
+### Synchronized direct subsurface (Intel HVF)
+
+Run the bounded popup command above (`--shared --disconnect --output-scale 2 --apks "$cache"`). The parent keeps a packed, uncomposited copy independent of client SHM and the host-owned DAX slot. Frames 5–7 used that copy without reattaching the parent buffer, which the client had already destroyed after frame 4.
+
+On Intel macOS 13.7.8 / QEMU 11.1.2 HVF, the harness withheld ACK 5 while two retained parent commits arrived. It verified that the DAX marker and all 442,368 frame bytes stayed unchanged. ACK 5 released one repaint with the latest parent-committed child state (6×4 at `(-2,8)`, clipped on the left), not the intermediate move or the later child state that had not been latched by a parent commit. The guest checked that neither parent callback completed early and waited for both ACK-paced completions. Frames 5–7 (initial overlay, clipped replacement, and removal) each matched the independent DAX reference and all 110,592 AppKit offscreen pixels.
+
+After remap, the fixture queued another retained repaint while ACK 8 was withheld. It destroyed the parent roles and surface first, then exercised and destroyed the still-live, inert subsurface. The host verified the held slot was unchanged, acknowledged frame 8 only after child teardown, and required server shutdown without another frame. The run reached `SUBSURFACE_OK`, `PARENT_FIRST_OK`, `POPUP_OK`, `RECONNECT_OK`, and `SCLEREID_M2_OK`. Native backing was 1×; the guest was told 2×. This is not scanout evidence.
+
+`swift test`: 89 passed. Zig guest build with warnings as errors, AppKit type-check with warnings as errors, Python byte compilation, Ruff F checks, Pyright (0 errors), and `git diff --check` passed.
+
+New non-NULL parent attaches while the slot is busy are still rejected. The fixture supports at most one callback on the deferred repaint; general callback queues, child callbacks, immediate removal without a parent commit, nested or reordered siblings, desynchronized mode, and alpha blending remain open.
+
+### GTK menu closeout checkpoint
+
+The shared `--disconnect --output-scale 2` HVF regression passed again: popup `131077` over parent `131075` reached `POPUP_OK`, `PARENT_FIRST_OK`, `RECONNECT_OK` and `SCLEREID_M2_OK`. Dismissal was caused by parent unmap, **not** by an outside click. Swift tests (89), AppKit warnings-as-errors type-check, Python byte compilation, Ruff F checks and `git diff --check` passed.
+
+Reproduce the real menu on this Intel HVF host:
+
+```sh
+M2_MENU=1 python3 docs/sclereid/m2/sclereid-m2.py "$iso" --gtk --apks "$cache"
+```
+
+All 66 locked GTK APKs verified after retrying incomplete downloads against an alternate Alpine mirror. On native 1× backing a scripted right press on A opened a GTK 3 menu (`gtk_menu_popup_at_pointer`). The opening serial matched the parent input event. The initial run failed after configure: GTK requested 114×32 window geometry at (6,5) inside a 126×44 SHM buffer. Accounting for that inset when placing the native window allowed the full menu frame to reach the AppKit layer. With the frame unacknowledged, a scripted press outside the menu on its parent caused `popup_done`; the harness required host window cleanup and GTK's `hide` signal before ACK. Output: `GTK_MENU_DONE 65542 126 44`, `GTK_INPUT_OK B 65540`, `GTK_RESIZE_OK 65539`, `GTK_OK`, `SCLEREID_M2_OK`.
+
+The opening and dismissal stimuli were injected on the host-to-guest seat channel, not physical mouse events. This covers one direct child and one seat, not menu item activation, nested menus, constraint handling, clicks outside all managed windows, or display scanout.
+
+### Remaining M2 acceptance
+
+- Real Qt and Electron SHM windows on HVF; GTK has bounded toplevel, input, resize, animation and close evidence above, not general toolkit compatibility.
+- Broader toolkit popup compatibility, nested grabs, outside clicks beyond managed windows, nested popups, movement and constraint adjustment; subsurface stacking, synchronization and teardown; real region, clipboard and drag-and-drop semantics.
+- Physical continuous edge drag, XDG resizing state and final-state delivery, and arbitrary event interleavings (including unmap or close with a frame in flight). The burst above tests scripted AppKit resize coalescing, not a drag gesture or refresh cadence.
+- Native 2× Retina backing and presentation, output enter/leave and display migration, dynamic/fractional scaling, transforms and viewporter. Offscreen pixels are not display scanout.
+- Physical input, full key layouts and modifiers, repeat and IME; transport fragmentation, repeated drops, unattended recovery and independent concurrent frame ports. Current reconnect creates a fresh session and does not restore old windows.
+- Refresh cadence and presentation latency under realistic load; Apple Silicon VM reproduction. DMA-BUF/GPU acceleration and application-level performance remain separate from this SHM acceptance.

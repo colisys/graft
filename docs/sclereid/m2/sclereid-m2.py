@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """One-shot Intel HVF → Wayland SHM → ext4 DAX → AppKit smoke test."""
 import argparse
+from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 import hashlib
 import mmap
@@ -90,8 +91,8 @@ def build(work, packages, weston, gtk=False):
 
 
 @contextmanager
-def child(cmd, work, **kwargs):
-    with sp.Popen(cmd, cwd=work, stdin=sp.PIPE, stdout=sp.PIPE, bufsize=0, **kwargs) as proc:
+def child(cmd, work, **kwargs) -> Iterator[sp.Popen[bytes]]:
+    with sp.Popen[bytes](cmd, cwd=work, stdin=sp.PIPE, stdout=sp.PIPE, bufsize=0, text=False, **kwargs) as proc:
         try:
             yield proc
         finally:
@@ -199,7 +200,7 @@ def play_animation(port, stream, region, window, report, slots, seconds, lane=0)
             samples[key].append(value)
         count += 1
         port.sendall(f'ACK {tick} {slot}\n'.encode('ascii'))
-    if not count:
+    if start is None:
         raise ValueError('animation did not submit any frames')
     print(f'ANIMATION_OK slots={slots} submitted={count}/{seconds * 60} '
           f'elapsed_ms={(now - start) * 1000:.2f} effective_fps={count / seconds:.2f}', flush=True)
@@ -299,16 +300,25 @@ def shared_smoke(work, vm, port, region, console, override, poweroff=True, sessi
     source = "override" if override is not None else "backing"
     print(f'OUTPUT_SCALE native={native} advertised={advertised} source={source}', flush=True)
     env = f'export M2_OUTPUT_SCALE={advertised} XDG_RUNTIME_DIR=/tmp/m2 WAYLAND_DISPLAY=m2 LD_LIBRARY_PATH=/tmp/bridge M2_SHARED=1 M2_SESSION={session}; '.encode()
+    if gtk: env += b'export XKB_CONFIG_ROOT=/tmp/bridge/xkb; '
+    menu = gtk and os.environ.get('M2_MENU') == '1'
+    if menu: env += b'export M2_MENU=1; '
     vm.stdin.write(env + b'rm -f /tmp/server-ok /tmp/client-ok; set -- /dev/vport*p1; exec 3<>"$1"; (/tmp/bridge/bridge server <&3 >&3 && touch /tmp/server-ok) & server=$!; '
                    b'for i in 1 2 3 4 5; do test -S /tmp/m2/m2 && break; sleep 1; done; ' +
-                   (b'XKB_CONFIG_ROOT=/tmp/bridge/xkb WAYLAND_DEBUG=client /tmp/bridge/gtk-client 3>&- & victim=$!\n' if gtk else
+                   (b'(/tmp/bridge/gtk-client && touch /tmp/gtk-ok) 3>&- & victim=$!\n' if gtk else
                     b'M2_VICTIM=1 /tmp/bridge/bridge client & victim=$!\n'))
     with ExitStack() as stack:
         windows, frames = {}, {}
         dropping = threading.Event()
-        def opened():
-            op, sid = line()
-            if op != 'OPEN' or sid in windows: raise ValueError((op, sid))
+        def opened(popup=None):
+            if popup is None:
+                op, sid = line()
+                if op != 'OPEN': raise ValueError((op, sid))
+                extra_env = {}
+            else:
+                sid, x, y = popup
+                extra_env = {'M2_POPUP_ORIGIN': f'{x} {y}'}
+            if sid in windows: raise ValueError(sid)
             rx, tx = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
             stack.enter_context(rx)
             thread = None
@@ -318,7 +328,8 @@ def shared_smoke(work, vm, port, region, console, override, poweroff=True, sessi
             stack.callback(join_forwarder)
             with tx:
                 win = stack.enter_context(child([work / 'window', '--weston'], work,
-                    env={**os.environ, 'M2_INPUT_FD': str(tx.fileno())}, pass_fds=(tx.fileno(),)))
+                    env={**os.environ, 'M2_INPUT_FD': str(tx.fileno()),
+                         'M2_VERIFY_PIXELS': '0' if gtk else '1', **extra_env}, pass_fds=(tx.fileno(),)))
             def forward():
                 with rx.makefile('rb') as events:
                     for event in events:
@@ -332,9 +343,10 @@ def shared_smoke(work, vm, port, region, console, override, poweroff=True, sessi
                             raise
             thread = threading.Thread(target=forward, daemon=True)
             thread.start()
+            assert win.stdout is not None
             windows[sid] = win, Reader(win.stdout.fileno())
             return sid
-        def pixels(expected, seq, width=64, height=48, remap=False):
+        def pixels(expected, seq, width=64, height=48, remap=False, origin=None, overlay=None):
             packet = line()
             if len(packet) != 7: raise ValueError(packet)
             op, sid, n, slot, w, h, scale = packet
@@ -355,6 +367,17 @@ def shared_smoke(work, vm, port, region, console, override, poweroff=True, sessi
             left, top = width//2, height//2
             expected_frame = ((colors[0]*left + colors[1]*(width-left))*top +
                               (colors[2]*left + colors[3]*(width-left))*(height-top))
+            if overlay is not None:
+                expected_frame = bytearray(expected_frame)
+                ox, oy, cw, ch = overlay
+                for y in range(ch):
+                    for x in range(cw):
+                        for dy in range(int(scale)):
+                            for dx in range(int(scale)):
+                                px, py = (ox+x)*int(scale)+dx, (oy+y)*int(scale)+dy
+                                if 0 <= px < width and 0 <= py < height:
+                                    pos = (py*width+px)*4
+                                    expected_frame[pos:pos+4] = colors[2*(y >= ch//2)+(x >= cw//2)]
             if frame != expected_frame: raise ValueError('shared DAX frame bytes')
             win, report = windows[sid]
             data = memoryview(struct.pack('<HHH',width,height,int(scale))+frame)
@@ -363,11 +386,19 @@ def shared_smoke(work, vm, port, region, console, override, poweroff=True, sessi
                 if not n: raise EOFError('window pipe')
                 data = data[n:]
             if remap and report.until(b'\n',15) != b'REMAPPED': raise ValueError('window remap')
+            if origin is not None and report.until(b'\n',15) != f'POPUP_ORIGIN {origin[0]} {origin[1]}'.encode():
+                raise ValueError('native popup origin')
             geometry = report.until(b'\n',15).decode().split()
             lw, lh = width//int(scale), height//int(scale)
             if geometry != ['GEOMETRY', str(lw), str(lh), 'backing', str(lw*native), str(lh*native)]:
                 raise ValueError(geometry)
             print('surface',sid,*geometry)
+            checks = (f'LAYER_OK contents_scale={native} buffer_scale={scale} filter=nearest',
+                      f'OFFSCREEN_2X_OK {2*lw}x{2*lh} exact_pixels={4*lw*lh} repeat={2//int(scale)}')
+            for expected_line in checks:
+                observed = report.until(b'\n',15).decode()
+                if observed != expected_line: raise ValueError(observed)
+                print('surface', sid, observed, flush=True)
             if not report.until(b'\n',15).startswith(b'FRAME_OK '): raise ValueError('window submit')
         def close_window(sid):
             win, report = windows[sid]
@@ -385,6 +416,7 @@ def shared_smoke(work, vm, port, region, console, override, poweroff=True, sessi
             console.until(b'GTK_WAYLAND_CONNECTED\r\n', 15)
             ids = set()
             sizes = set()
+            by_width = {}
             try:
                 while len(sizes) < 2:
                     packet = line()
@@ -416,13 +448,104 @@ def shared_smoke(work, vm, port, region, console, override, poweroff=True, sessi
                         raise ValueError(geometry)
                     ids.add(sid)
                     sizes.add((w,h))
+                    by_width[w] = sid
                     print(f'GTK_FRAME surface={sid} slot={slot} {geometry.decode()} sha256={hashlib.sha256(frame).hexdigest()}', flush=True)
                 if set(windows) != ids: raise ValueError('unexpected GTK toplevels')
-                vm.stdin.write(b'kill -0 "$victim" && echo GTK_ALIVE; kill -TERM "$victim"; wait "$victim"\n')
-                console.until(b'GTK_ALIVE\r\n', 10)
-                closed(ids.copy())
-                for sid in ids:
+                def gtk_input(width,label):
+                    sid = by_width[width]
+                    win, report = windows[sid]
+                    win.stdin.write(struct.pack('<HH',0,6))
+                    if report.until(b'\n',10) != b'COMMAND_OK': raise ValueError('GTK injection')
+                    for typ,value,shift in ((4,1,0),(7,1,0),(4,3,0),(7,3,0),(31,0,0),(8,65505,0),(8,65,1),(9,65,1),(9,65505,1)):
+                        console.until(b'GTK_EVENT ',10)
+                        actual = console.until(b'\n',10).decode().rstrip('\r')
+                        if actual.strip() != f'{label} {typ} {value} {shift}': raise ValueError(actual)
+                    print('GTK_INPUT_OK',label,sid,flush=True)
+                if menu:
+                    parent=by_width[128]
+                    port.sendall(f'I {parent} M 11 8\nI {parent} B 1 1\n'.encode())
+                    console.until(b'M2_MENU_GRAB ',10)
+                    grabbed=console.until(b'\n',10).strip().decode()
+                    packet=line()
+                    if packet[:3]!=['POPUP',grabbed,parent]: raise ValueError(packet)
+                    op,sid,n,slot,pw,ph,scale=line()
+                    if (op,sid,n,scale)!=('PIXELS',grabbed,'1','1'): raise ValueError((op,sid,n,scale))
+                    _,x,y,dx,dy=packet[2:]
+                    win,report=windows[parent]
+                    win.stdin.write(struct.pack('<HH',0,8))
+                    label,left,top=report.until(b'\n',10).decode().split()
+                    if label!='CONTENT_ORIGIN' or report.until(b'\n',10)!=b'COMMAND_OK': raise ValueError(label)
+                    origin=(int(left)+int(x)+int(dx),int(top)-int(y)-int(dy)-int(ph))
+                    opened((sid,*origin))
+                    marker=MARKER[:-1]+bytes([MARKER[-1]+int(slot)])
+                    off=region.find(marker)
+                    if off<0 or off%4096 or off in frames.values() or not 0<=int(slot)<8: raise ValueError('menu slot')
+                    start=off+len(marker)
+                    frame=region[start:start+int(pw)*int(ph)*4]
+                    if not any(frame): raise ValueError('empty menu')
+                    win,report=windows[sid]
+                    win.stdin.write(struct.pack('<HHH',int(pw),int(ph),1)+frame)
+                    for expected in (f'POPUP_ORIGIN {origin[0]} {origin[1]}',f'GEOMETRY {pw} {ph} backing {int(pw)*native} {int(ph)*native}'):
+                        actual=report.until(b'\n',10).decode()
+                        if actual!=expected: raise ValueError(actual)
+                    if not report.until(b'\n',10).startswith(b'FRAME_OK '): raise ValueError('menu submission')
+                    port.sendall(f'I {parent} B 0 1\nI {parent} M 2 2\nI {parent} B 1 0\nI {parent} B 0 0\n'.encode())
+                    if line()!=['CLOSED',sid]: raise ValueError('expected menu dismissal')
+                    close_window(sid)
+                    console.until(b'GTK_MENU_HIDDEN\r\n',10)
                     port.sendall(f'ACK {sid} 1\n'.encode())
+                    print('GTK_MENU_DONE',sid,pw,ph,flush=True)
+                else: gtk_input(128,'A')
+                gtk_input(160,'B')
+                target = by_width[128]
+                win, report = windows[target]
+                win.stdin.write(struct.pack('<HH',0,5))
+                if report.until(b'\n',10) != b'COMMAND_OK': raise ValueError('GTK resize')
+                port.sendall(f'ACK {target} 1\n'.encode())
+                op,sid,n,slot,w,h,scale=line()
+                if (op,sid,n,w,h,scale)!=('PIXELS',target,'2','160','120','1'): raise ValueError((op,sid,n,w,h,scale))
+                start=frames[target]+len(MARKER)
+                frame=region[start:start+160*120*4]
+                if not any(frame): raise ValueError('empty resized buffer')
+                win.stdin.write(struct.pack('<HHH',160,120,1)+frame)
+                if report.until(b'\n',10)!=f'GEOMETRY 160 120 backing {160*native} {120*native}'.encode() or not report.until(b'\n',10).startswith(b'FRAME_OK '): raise ValueError('GTK resized layer')
+                print('GTK_RESIZE_OK',sid,flush=True)
+                survivor = by_width[160]
+                seq = {target:2, survivor:1}
+                def advance(sid, w, h):
+                    port.sendall(f'ACK {sid} {seq[sid]}\n'.encode())
+                    seq[sid] += 1
+                    op,actual,n,slot,pw,ph,scale = line()
+                    if (op,actual,int(n),int(pw),int(ph),scale) != ('PIXELS',sid,seq[sid],w,h,'1'):
+                        raise ValueError((actual,n,pw,ph))
+                    off = frames[sid]
+                    if region[off+len(MARKER)-1] != MARKER[-1]+int(slot): raise ValueError('slot changed')
+                    frame = region[off+len(MARKER):off+len(MARKER)+w*h*4]
+                    pixel = frame[(w*h//2+w//2)*4:][:4]
+                    if pixel[:3:2] != (b'\x00\xff' if sid==target else b'\xff\x00'): raise ValueError(pixel)
+                    win,report = windows[sid]
+                    win.stdin.write(struct.pack('<HHH',w,h,1)+frame)
+                    if report.until(b'\n',10)!=f'GEOMETRY {w} {h} backing {w*native} {h*native}'.encode() or not report.until(b'\n',10).startswith(b'FRAME_OK '): raise ValueError('animated layer')
+                    return hashlib.sha256(frame).hexdigest()
+                def native_close(sid,label):
+                    win,report = windows[sid]
+                    win.stdin.write(struct.pack('<HH',0,2))
+                    if report.until(b'\n',10)!=b'COMMAND_OK': raise ValueError('native close')
+                    console.until(b'GTK_DELETE ',10)
+                    if console.until(b'\n',10).strip()!=label.encode(): raise ValueError('wrong GTK close')
+                    closed({sid})
+                    port.sendall(f'ACK {sid} {seq[sid]}\n'.encode())
+                    print('GTK_CLOSE_OK',label,sid,flush=True)
+                for sid,h in ((target,120),(survivor,96)):
+                    if len({advance(sid,160,h) for _ in range(3)})!=3: raise ValueError('static GTK window')
+                native_close(target,'A')
+                hashes = [advance(survivor,160,96) for _ in range(5)]
+                if len(set(hashes))!=5: raise ValueError('static survivor')
+                print('GTK_SURVIVOR_OK',survivor,*hashes,flush=True)
+                gtk_input(160,'B')
+                native_close(survivor,'B')
+                vm.stdin.write(b'wait "$victim"; test -f /tmp/gtk-ok && echo GTK_EXIT_OK\n')
+                console.until(b'GTK_EXIT_OK\r\n',10)
                 port.sendall(b'STOP\n')
                 if line() != ['DONE']: raise ValueError('GTK server exit')
                 vm.stdin.write(b'wait "$server"; test -f /tmp/server-ok && test ! -e /tmp/m2/m2 && test ! -e /tmp/m2/m2.lock && echo GTK_CLEAN\n')
@@ -478,6 +601,7 @@ def shared_smoke(work, vm, port, region, console, override, poweroff=True, sessi
         inject(c,"S0")
         print("SEAT_OK: V0 -> S0 -> V1 -> survivor S0")
         for sid in (a,b,c): port.sendall(f'ACK {sid} 1\n'.encode())
+        del frames[a], frames[b]
         pixels(c,2); port.sendall(f'ACK {c} 2\n'.encode())
         def command(code):
             win, report = windows[c]
@@ -486,16 +610,57 @@ def shared_smoke(work, vm, port, region, console, override, poweroff=True, sessi
         command(5)
         pixels(c,3,160*advertised,120*advertised)
         print(f'RESIZE_OK: surface {c} logical=160x120 buffer={160*advertised}x{120*advertised}')
+        command(7)
+        for w, h in ((170, 130), (180, 140), (192, 144)):
+            console.until(f'M2_RESIZE_PENDING {c} {w} {h}\r\n'.encode(), 10)
         port.sendall(f'ACK {c} 3\n'.encode())
+        pixels(c,4,192*advertised,144*advertised)
+        print(f'RESIZE_BURST_OK: surface {c} coalesced 3 events to 192x144', flush=True)
+        port.sendall(f'ACK {c} 4\n'.encode())
+        def held_slot():
+            _, off = frames[c]
+            return region[off:off + len(MARKER) + 192*144*advertised**2*4]
+
+        pixels(c,5,192*advertised,144*advertised,overlay=(3,5,8,6))
+        held = held_slot()
+        console.until(b'FIXTURE_REPAINT_QUEUED\r\n',10)
+        if held_slot() != held: raise ValueError('retained repaint modified unacknowledged DAX slot')
+        port.sendall(f'ACK {c} 5\n'.encode())
+        pixels(c,6,192*advertised,144*advertised,overlay=(-2,8,6,4))
+        port.sendall(f'ACK {c} 6\n'.encode())
+        pixels(c,7,192*advertised,144*advertised)
+        port.sendall(f'ACK {c} 7\n'.encode())
+        print('SUBSURFACE_OK: held slot unchanged; two commits coalesced; unlatched child state excluded; removal exact', flush=True)
+        packet = line()
+        if len(packet) != 7 or packet[0] != 'POPUP' or packet[2:] != [c, '9', '7', '2', '3']:
+            raise ValueError(packet)
+        parent, report = windows[c]
+        parent.stdin.write(struct.pack('<HH', 0, 8))
+        label, left, top = report.until(b'\n', 10).decode().split()
+        if label != 'CONTENT_ORIGIN' or report.until(b'\n', 10) != b'COMMAND_OK':
+            raise ValueError('parent native origin')
+        origin = (int(left) + 11, int(top) - 22)
+        popup = opened((packet[1], *origin))
+        pixels(popup, 1, 16*advertised, 12*advertised, origin=origin)
+        command(2)
+        closed({popup})
+        port.sendall(f'ACK {popup} 1\n'.encode())
+        console.until(b'FIXTURE_POPUP_DONE\r\n', 10)
+        print(f'POPUP_OK: {popup} parent={c} relative=9,7 size=16x12 native_origin={origin}; parent unmap dismissed unacked popup', flush=True)
         if line() != ['UNMAP', c]: raise ValueError('expected explicit unmap')
         command(4)
         print(f'UNMAP_OK: surface {c} gone from WindowServer')
-        pixels(c,4,remap=True)
+        pixels(c,8,remap=True)
+        held = held_slot()
+        console.until(b'FIXTURE_TEARDOWN_QUEUED\r\n',10)
         inject(c,'S0')
-        port.sendall(f'ACK {c} 4\n'.encode())
         print(f'REMAP_OK: surface {c} reused slot {frames[c][0]} and accepted input')
         command(2)
         closed({c})
+        console.until(b'FIXTURE_PARENT_FIRST_DONE\r\n',10)
+        if held_slot() != held: raise ValueError('parent teardown modified unacknowledged DAX slot')
+        port.sendall(f'ACK {c} 8\n'.encode())
+        print('PARENT_FIRST_OK: live subsurface outlived parent; deferred repaint cancelled before ACK', flush=True)
         print(f'CLOSE_OK: AppKit performClose -> xdg_toplevel.close -> client destroyed surface {c}')
         port.sendall(b'STOP\n')
         if line()!=['DONE']: raise ValueError('shared server exit')
@@ -508,7 +673,7 @@ def shared_smoke(work, vm, port, region, console, override, poweroff=True, sessi
         print('SHARED_OK: 2 clients, 3 AppKit toplevels; SIGKILL with 2 unacked slots; survivor submitted again')
 
 
-def vm_command(work, iso, ports=1):
+def vm_command(work, iso, ports=1, *, block_payload=False):
     for kind in ('vmlinuz', 'initramfs'):
         with (work / kind).open('wb') as out:
             sp.run(['bsdtar', '-xOf', iso, f'boot/{kind}-lts'], stdout=out, check=True)
@@ -518,8 +683,9 @@ def vm_command(work, iso, ports=1):
            '-initrd', 'initramfs', '-cdrom', str(iso), '-append',
            'console=ttyS0,115200 modules=loop,squashfs,sd-mod,sr-mod',
            '-object', 'memory-backend-file,id=r,size=32M,mem-path=region,share=on',
-           '-device', 'virtio-pmem-pci,memdev=r', '-device', 'virtio-serial-pci,id=v',
-           '-fw_cfg', 'name=opt/sclereid/m2,file=guest.tar']
+           '-device', 'virtio-pmem-pci,memdev=r', '-device', 'virtio-serial-pci,id=v']
+    if not block_payload:
+        cmd += ['-fw_cfg', 'name=opt/sclereid/m2,file=guest.tar']
     for i in range(ports):
         name = 'frames' if not i else f'frames{i}'
         cmd.extend(['-chardev', f'socket,id=f{i},path=./{name},server=on,wait=off',
@@ -528,14 +694,15 @@ def vm_command(work, iso, ports=1):
 
 
 def run(work, iso, animate, slots, seconds, weston, disconnect=False, retina=False, shared=False, reconnect=False, output_scale=None, gtk=False):
-    cmd = vm_command(work, iso)
-    if gtk:
-        with (work / 'gtk.tar').open('ab') as archive:
-            archive.write(bytes(-archive.tell() % 512))
-        cmd += ['-drive', 'if=virtio,format=raw,readonly=on,file=gtk.tar']
+    cmd = vm_command(work, iso, block_payload=True)
+    payload = 'gtk.tar' if gtk else 'guest.tar'
+    with (work / payload).open('ab') as archive:
+        archive.write(bytes(-archive.tell() % 512))
+    cmd += ['-drive', f'if=virtio,format=raw,readonly=on,file={payload}']
     with (work / 'region').open('xb+') as file:
         file.truncate(REGION_BYTES)
         with mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as region, child(cmd, work) as vm:
+            assert vm.stdin is not None and vm.stdout is not None
             console = Reader(vm.stdout.fileno())
             console.until(b'localhost login:', 90)
             vm.stdin.write(b'root\n')
@@ -550,29 +717,21 @@ def run(work, iso, animate, slots, seconds, weston, disconnect=False, retina=Fal
                     port.connect('frames')
                 finally:
                     os.chdir(previous)
-                if not gtk:
-                    vm.stdin.write(
-                        b'modprobe virtio_pmem && modprobe nd_pmem && modprobe ext4 && '
-                        b'modprobe virtio_console && modprobe qemu_fw_cfg && mdev -s && '
-                        b'apk add --no-network e2fsprogs && mkfs.ext4 -F -b 4096 /dev/pmem0 && '
-                        b'mount -t ext4 -o dax=always /dev/pmem0 /mnt && '
-                        b'mkdir -m 700 /tmp/bridge /tmp/m2 && '
-                        b'tar -xzf /sys/firmware/qemu_fw_cfg/by_name/opt/sclereid/m2/raw -C /tmp/bridge && '
-                        b'echo GUEST_READY\n')
-                    console.until(b'GUEST_READY\r\n', 180)
-                else:
-                    vm.stdin.write(
-                        b'modprobe virtio_pmem && modprobe nd_pmem && modprobe ext4 && '
-                        b'modprobe virtio_console && modprobe qemu_fw_cfg && mdev -s && '
-                        b'apk add --no-network e2fsprogs && mkfs.ext4 -F -b 4096 /dev/pmem0 && echo M2_FORMATTED\n')
-                    console.until(b'M2_FORMATTED\r\n', 45)
-                    vm.stdin.write(b'mount -t ext4 -o dax=always /dev/pmem0 /mnt && echo M2_MOUNTED\n')
-                    console.until(b'M2_MOUNTED\r\n', 45)
+                guest_input = vm.stdin
+
+                def setup_step(command: bytes, marker: bytes, timeout: int):
+                    guest_input.write(command + b' && echo ' + marker + b'\n')
+                    console.until(marker + b'\r\n', timeout)
                     console.until(b'localhost:~# ', 10)
-                    setup = (b'modprobe virtio_blk && mdev -s && tar -xzf /dev/vda -C /tmp/bridge' if gtk else
-                             b'tar -xzf /sys/firmware/qemu_fw_cfg/by_name/opt/sclereid/m2/raw -C /tmp/bridge')
-                    vm.stdin.write(b'mkdir -m 700 /tmp/bridge /tmp/m2 && ' + setup + b' && echo GUEST_READY\n')
-                    console.until(b'GUEST_READY\r\n', 25)
+                    print(marker.decode(), flush=True)
+
+                setup_step(b'modprobe virtio_pmem && modprobe nd_pmem && modprobe ext4 && '
+                           b'modprobe virtio_console && mdev -s && apk add --no-network e2fsprogs',
+                           b'M2_MODULES_READY', 45)
+                setup_step(b'mkfs.ext4 -F -b 4096 /dev/pmem0', b'M2_FORMATTED', 45)
+                setup_step(b'mount -t ext4 -o dax=always /dev/pmem0 /mnt', b'M2_MOUNTED', 45)
+                setup_step(b'modprobe virtio_blk && mdev -s && mkdir -m 700 /tmp/bridge /tmp/m2 && '
+                           b'tar -xzf /dev/vda -C /tmp/bridge', b'GUEST_READY', 45)
 
                 if shared or gtk:
                     previous_frames = shared_smoke(work, vm, port, region, console,
@@ -605,6 +764,7 @@ def run(work, iso, animate, slots, seconds, weston, disconnect=False, retina=Fal
                 frame_port = Reader(port.fileno())
                 window_args = ['--animate'] if animate else ['--weston'] if weston else ['--retina'] if retina else []
                 with child([work / 'window', *window_args], work) as window:
+                    assert window.stdin is not None and window.stdout is not None
                     report = Reader(window.stdout.fileno())
                     if weston:
                         try:
