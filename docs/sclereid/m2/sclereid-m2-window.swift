@@ -847,6 +847,13 @@ private final class MenuInputPopup: NSWindow {
 private final class MenuTree: NSObject, NSWindowDelegate {
     let input: Bool
     init(input: Bool) { self.input = input }
+    private var keyUpMonitor: Any?
+
+    func stopMonitoringKeyUp() {
+        if let keyUpMonitor { NSEvent.removeMonitor(keyUpMonitor) }
+        keyUpMonitor = nil
+    }
+
     // Newest live popup owns menu navigation, without becoming macOS key.
     private var targets = [Int]()
     private func forward(_ op: String, _ x: Int, _ y: Int) {
@@ -943,6 +950,16 @@ private final class MenuTree: NSObject, NSWindowDelegate {
             depth = p.depth + 1
         } else {
             win = openWindow(view, inputDelegate: input ? self : nil)
+            if let inputView = view as? MenuInputView {
+                // AppKit can consume Command chord releases before NSResponder.keyUp.
+                keyUpMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyUp) { [weak win, weak inputView] event in
+                    guard let win, let inputView, win.isKeyWindow, win.firstResponder === inputView,
+                          event.window == nil || event.window === win,
+                          MenuInputView.codes[event.keyCode] != nil else { return event }
+                    inputView.keyUp(with: event)
+                    return nil
+                }
+            }
             depth = 0
         }
         win.acceptsMouseMovedEvents = true
@@ -1044,6 +1061,7 @@ private func receiveMenuTree(input: Bool = false) {
         }
     }
     DispatchQueue.main.sync {
+        host.stopMonitoringKeyUp()
         host.close(nil)
         if window != nil { cleanup() }
         report("CLEANUP_OK")

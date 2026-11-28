@@ -1,5 +1,5 @@
 /* Shared DAX layout: capacity, not an XDG nesting limit. Change only in sync
- * with the host. GTK also creates roleless and cursor surfaces which never
+ * with the host. Roleless, cursor and drag icon surfaces never
  * publish a frame: keep their guest-only metadata separate from frame slots. */
 enum { DAX_SLOTS = 8, NSURF = 2 * DAX_SLOTS };
 static struct shared_surface {
@@ -23,7 +23,7 @@ static struct shared_surface {
     int64_t work_x, work_y;
     int work_w, work_h; /* parent-content points, Y down; zero width disables */
     int geom_x, geom_y, geom_w, geom_h, input_x, input_y;
-    int cursor_role, xdg_role, close_pending;
+    int cursor_role, drag_icon_role, xdg_role, close_pending;
     int keyboard_grab, frame_slot; /* one-based, zero until first frame */
     uint32_t grab_serial, button_serial;
     int move_press;
@@ -78,7 +78,7 @@ static void set_cursor(struct wl_client *c,struct wl_resource *r,uint32_t serial
     if (!s) return;
     /* Record the lifetime role only. There is no host cursor image or hotspot update. */
     struct shared_surface *p=wl_resource_instance_of(s,&wl_surface_interface,&shared_ops) ? wl_resource_get_user_data(s) : NULL;
-    if (!p || p->xd || p->xdg_role || p->sub_role) {
+    if (!p || p->xd || p->xdg_role || p->sub_role || p->drag_icon_role) {
         wl_resource_post_error(r,WL_POINTER_ERROR_ROLE,"surface already has an incompatible role");
         return;
     }
@@ -132,15 +132,63 @@ static void bind_seat(struct wl_client *c,void *data,uint32_t v,uint32_t id) {
     if (v >= 2) wl_seat_send_name(r, "m2");
     wl_seat_send_capabilities(r,WL_SEAT_CAPABILITY_POINTER|WL_SEAT_CAPABILITY_KEYBOARD);
 }
+/* GTK 3 needs a data device to initialize its seat. Keep v1 only: no
+ * selection ownership, offers or transfers, and cancel on attempted use. */
+#define DATA_DIAG(event, disposition) \
+    fprintf(stderr, "%s:%d event=" event " disposition=" disposition "\n", __FILE__, __LINE__)
+static void data_offer_type(struct wl_client *c, struct wl_resource *r, const char *mime) {
+    (void)c; (void)r; (void)mime;
+}
+static void create_data_source(struct wl_client *c, struct wl_resource *r, uint32_t id) {
+    (void)r;
+    static const struct wl_data_source_interface ops = {.offer=data_offer_type, .destroy=destroy_resource};
+    struct wl_resource *source = wl_resource_create(c, &wl_data_source_interface, 1, id);
+    if (!source) { wl_client_post_no_memory(c); return; }
+    wl_resource_set_implementation(source, &ops, NULL, NULL);
+    DATA_DIAG("wl_data_device_manager.create_data_source", "inert-source");
+}
+static void set_selection(struct wl_client *c, struct wl_resource *r, struct wl_resource *source, uint32_t serial) {
+    (void)c; (void)r; (void)serial;
+    if (source) {
+        wl_data_source_send_cancelled(source);
+        DATA_DIAG("wl_data_device.set_selection", "cancelled");
+    } else {
+        DATA_DIAG("wl_data_device.set_selection", "already-empty");
+    }
+}
+static void start_drag(struct wl_client *c, struct wl_resource *r, struct wl_resource *source,
+                       struct wl_resource *origin, struct wl_resource *icon, uint32_t serial) {
+    (void)c; (void)serial;
+    if (icon) {
+        struct shared_surface *p = wl_resource_instance_of(icon,&wl_surface_interface,&shared_ops)
+            ? wl_resource_get_user_data(icon) : NULL;
+        if (!p || icon==origin || p->xd || p->xdg_role || p->sub_role || p->cursor_role) {
+            DATA_DIAG("wl_data_device.start_drag", "rejected-icon-role");
+            wl_resource_post_error(r, WL_DATA_DEVICE_ERROR_ROLE, "invalid drag icon surface role");
+            return;
+        }
+        /* Cancelled drags can still have icon requests queued on the wire. */
+        p->drag_icon_role=1;
+        DATA_DIAG("wl_data_device.start_drag", "discard-icon");
+    }
+    if (source) {
+        wl_data_source_send_cancelled(source);
+        DATA_DIAG("wl_data_device.start_drag", "cancelled");
+    } else {
+        DATA_DIAG("wl_data_device.start_drag", "ignored-no-source");
+    }
+}
+#undef DATA_DIAG
 static void data_device(struct wl_client *c, struct wl_resource *r, uint32_t id, struct wl_resource *seat) {
     (void)r; (void)seat;
     struct wl_resource *device = wl_resource_create(c, &wl_data_device_interface, 1, id);
     if (!device) { wl_client_post_no_memory(c); return; }
-    wl_resource_set_implementation(device, NULL, NULL, NULL);
+    static const struct wl_data_device_interface ops = {.start_drag=start_drag, .set_selection=set_selection};
+    wl_resource_set_implementation(device, &ops, NULL, NULL);
 }
 static void bind_data_manager(struct wl_client *c, void *data, uint32_t v, uint32_t id) {
     (void)data;
-    static const struct wl_data_device_manager_interface ops = {.get_data_device=data_device};
+    static const struct wl_data_device_manager_interface ops = {.create_data_source=create_data_source, .get_data_device=data_device};
     struct wl_resource *r = wl_resource_create(c, &wl_data_device_manager_interface, v, id);
     if (!r) { wl_client_post_no_memory(c); return; }
     wl_resource_set_implementation(r, &ops, NULL, NULL);
@@ -411,6 +459,16 @@ static void seat_input(unsigned id,char op,int x,int y) {
     if (keyboard_mode && domain && op=='K' && key_focus && key_focus->keyboard_grab) {
         inside=1; id=key_focus->id;
     }
+    /* An ungrabbed popup gets pointer events while its toplevel keeps the keyboard. */
+    if (keyboard_mode && !grab && op=='K' && key_focus) {
+        for (int i=0; i<NSURF; ++i) {
+            struct shared_surface *p=&windows[i];
+            if (p->id==id && p->parent_id && input_domain(p)==key_focus) {
+                id=key_focus->id;
+                break;
+            }
+        }
+    }
     if (!popup_mode && grab && grab->id!=id && !strchr("RCL",op)) {
         if (button && down && grab->mapped_w) dismiss_children(grab->parent);
         return;
@@ -454,21 +512,21 @@ static void seat_input(unsigned id,char op,int x,int y) {
                 deliver(pointer_focus,'V',0,0); pointer_focus=p; deliver(p,'E',x,y);
             }
             deliver(p,'M',x,y);
-            if(op=='D') { if (keyboard_mode && !grab) focus_keyboard(p); right_down=1; deliver(p,'D',x,y); }
+            if(op=='D') { if (keyboard_mode && !grab) focus_keyboard(input_domain(p)); right_down=1; deliver(p,'D',x,y); }
         } else if(op=='B' && pointer_focus==p && (x==0 || x==1) && x!=pressed) {
-            if(x && (!keyboard_mode || !grab)) focus_keyboard(p);
+            if (x && (!keyboard_mode || !grab)) focus_keyboard(keyboard_mode ? input_domain(p) : p);
             if (x) { trigger=NULL; p->button_serial=0; }
             /* y carries the host press ID so a delayed move cannot start on a later press. */
             p->move_press=keyboard_mode && x ? y : 0;
             pressed=x; deliver(p,op,x,0);
         } else if(op=='Q' && pointer_focus==p && !right_down) {
-            if (!popup_mode || !grab) focus_keyboard(p);
+            if (!popup_mode || !grab) focus_keyboard(keyboard_mode ? input_domain(p) : p);
             right_down=1;
             deliver(p,'Q',0,0);
         } else if(keyboard_mode && op=='P' && pointer_focus==p) {
             uint32_t mask=1u<<(x-BTN_MOUSE);
             if (!!(extra_down & mask)!=y) {
-                if (y && !grab) focus_keyboard(p);
+                if (y && !grab) focus_keyboard(input_domain(p));
                 extra_down^=mask;
                 deliver(p,'P',x,y);
             }
@@ -510,7 +568,7 @@ static void sub_stack(struct wl_client *c, struct wl_resource *r, struct wl_reso
 static void get_sub(struct wl_client *c, struct wl_resource *r, uint32_t id,
                     struct wl_resource *child, struct wl_resource *parent) {
     struct shared_surface *p = wl_resource_get_user_data(child), *q = wl_resource_get_user_data(parent);
-    if (p == q || p->xd || p->xdg_role || p->cursor_role || p->sub || !q->top || q->parent_id) {
+    if (p == q || p->xd || p->xdg_role || p->cursor_role || p->drag_icon_role || p->sub || !q->top || q->parent_id) {
         wl_resource_post_error(r, WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE, "expected direct toplevel child");
         return;
     }
@@ -592,7 +650,7 @@ static void shared_buffer_gone(struct wl_listener *l, void *unused) {
 static void shared_attach(struct wl_client *c, struct wl_resource *r, struct wl_resource *b, int x, int y) {
     (void)c;
     struct shared_surface *p = wl_resource_get_user_data(r);
-    if (x || y) { wl_resource_post_error(r, 0, "offset unsupported"); return; }
+    if ((x || y) && !p->drag_icon_role) { wl_resource_post_error(r, 0, "offset unsupported"); return; }
     if (p->buf) wl_list_remove(&p->gone.link);
     p->attached = 1;
     p->buf = b;
@@ -700,8 +758,8 @@ static void shared_commit(struct wl_client *c, struct wl_resource *r) {
     (void)c;
     struct shared_surface *p = wl_resource_get_user_data(r);
     if (p->sub_role) { sub_commit(p); return; }
-    if (p->cursor_role) {
-        /* Discard the cursor image locally; never allocate a host frame or await an ACK. */
+    if (p->cursor_role || p->drag_icon_role) {
+        /* Discard the image locally; never allocate a host frame or await an ACK. */
         p->scale=p->pending_scale;
         if (p->attached && p->buf) shared_release_buffer(p);
         p->attached=0;
@@ -709,7 +767,13 @@ static void shared_commit(struct wl_client *c, struct wl_resource *r) {
         return;
     }
     if (!popup_mode && ((!p->top && !p->popup) || p->dismissed)) return;
-    if (popup_mode && !p->top) goto invalid;
+    if (popup_mode && !p->top) {
+        /* Chromium commits a NULL attachment before assigning the popup role. */
+        if (p->buf) goto invalid;
+        p->attached=0;
+        p->scale=p->pending_scale;
+        return;
+    }
     memcpy(p->geometry, p->pending_geometry, sizeof p->geometry);
     p->scale = p->pending_scale;
     int w=p->base_w, h=p->base_h;
@@ -840,7 +904,13 @@ static void bind_output(struct wl_client *c,void *data,uint32_t v,uint32_t id) {
     wl_output_send_mode(r,WL_OUTPUT_MODE_CURRENT,1280,960,60000);
     if(v>=2) { wl_output_send_scale(r,shared_output_scale); wl_output_send_done(r); }
 }
+static void shared_transform(struct wl_client *c, struct wl_resource *r, int32_t transform) {
+    (void)c;
+    if (transform != WL_OUTPUT_TRANSFORM_NORMAL)
+        wl_resource_post_error(r, WL_SURFACE_ERROR_INVALID_TRANSFORM, "only normal buffer transform is supported");
+}
 static const struct wl_surface_interface shared_ops = {
+    .set_buffer_transform=shared_transform,
     .destroy=destroy_resource, .set_buffer_scale=shared_scale, .attach=shared_attach, .commit=shared_commit, .frame=shared_callback,
     .damage=damage, .set_input_region=ignore_region, .set_opaque_region=ignore_region
 };
@@ -896,9 +966,12 @@ static int place_popup(struct shared_surface *p, struct shared_surface *parent, 
     if (!parent || !parent->top || parent->dismissed ||
         (parent->parent_id && (!tree_mode || parent!=grab || popup_child(parent->id)))) return 0;
     /* A grabbed popup's window geometry is fixed at placement, before its first buffer. */
-    int pw=parent->parent_id ? parent->popup_w : parent->mapped_w;
-    int ph=parent->parent_id ? parent->popup_h : parent->mapped_h;
-    if (!pw || !pos->rw || !pos->w || pos->w>width || pos->h>height || pos->x<0 || pos->y<0 ||
+    int pw=parent->parent_id ? parent->popup_w : (parent->geometry[2] ?: parent->mapped_w);
+    int ph=parent->parent_id ? parent->popup_h : (parent->geometry[3] ?: parent->mapped_h);
+    int origin_x=parent->parent_id ? 0 : parent->geometry[0];
+    int origin_y=parent->parent_id ? 0 : parent->geometry[1];
+    if ((!parent->parent_id && !parent->mapped_w) || !pw || !pos->rw || !pos->w ||
+        pos->w>width || pos->h>height || pos->x<0 || pos->y<0 ||
         pos->rw>pw-pos->x || pos->rh>ph-pos->y) return 0;
     int ax=horizontal[pos->anchor], ay=vertical[pos->anchor], gx=horizontal[pos->gravity], gy=vertical[pos->gravity];
     int64_t raw_x=popup_axis(pos->x,pos->rw,ax,pos->w,gx,pos->dx), x=raw_x;
@@ -906,16 +979,17 @@ static int place_popup(struct shared_surface *p, struct shared_surface *parent, 
     if (parent->work_w) {
         /* Positioner size describes the visible geometry, not GTK's shadow buffer. */
         x=constrain_axis(x,popup_axis(pos->x,pos->rw,-ax,pos->w,-gx,pos->dx),pos->w,
-                         parent->work_x,parent->work_w,pos->adjust & 4u,pos->adjust & 1u);
+                         parent->work_x-origin_x,parent->work_w,pos->adjust & 4u,pos->adjust & 1u);
         y=constrain_axis(y,popup_axis(pos->y,pos->rh,-ay,pos->h,-gy,pos->dy),pos->h,
-                         parent->work_y,parent->work_h,pos->adjust & 8u,pos->adjust & 2u);
+                         parent->work_y-origin_y,parent->work_h,pos->adjust & 8u,pos->adjust & 2u);
         fprintf(stderr,"GTK_MENU_EDGE parent=%u popup=%u raw=%lld,%lld adjusted=%lld,%lld size=%d,%d work=%lld,%lld,%d,%d flags=%u\n",
                 parent->id,p->id,(long long)raw_x,(long long)raw_y,(long long)x,(long long)y,pos->w,pos->h,
                 (long long)parent->work_x,(long long)parent->work_y,parent->work_w,parent->work_h,pos->adjust);
     }
     if (x<INT32_MIN || x>INT32_MAX || y<INT32_MIN || y>INT32_MAX) return 0;
     /* Each positioner uses its immediate parent's window geometry origin. */
-    p->work_x=parent->work_x-x; p->work_y=parent->work_y-y;
+    if (x+origin_x>INT32_MAX || y+origin_y>INT32_MAX) return 0;
+    p->work_x=parent->work_x-origin_x-x; p->work_y=parent->work_y-origin_y-y;
     p->work_w=parent->work_w; p->work_h=parent->work_h;
     p->parent_id=parent->id; p->popup_x=x; p->popup_y=y; p->popup_w=pos->w; p->popup_h=pos->h;
     return 1;
@@ -945,7 +1019,7 @@ static int shared_dispatch(const void *iface, void *target, uint32_t op, const s
     if (iface==&shell_base && op==2) {
         struct wl_resource *s=(void*)a[1].o;
         p=wl_resource_get_user_data(s);
-        if (!p || p->xd || p->cursor_role || p->sub_role) goto invalid;
+        if (!p || p->xd || p->cursor_role || p->drag_icon_role || p->sub_role) goto invalid;
         out=&p->xd; type=&shell_surface;
     } else if (iface==&shell_surface && op==1 && !p->top && !p->popup && !p->dismissed) {
         out=&p->top; type=&shell_top;
@@ -982,7 +1056,7 @@ static int shared_dispatch(const void *iface, void *target, uint32_t op, const s
     } else if (iface==&shell_surface && op==4 && p->serial && p->serial==a[0].u) {
         p->serial=0; p->configured=1; shared_resize(p); return 0;
     } else if (iface==&shell_surface && op==3) {
-            if (!popup_mode) {
+            if (!popup_mode || (menu_mode && !p->parent_id)) {
                 if (a[2].i<=0 || a[3].i<=0) goto invalid;
                 for (int i=0;i<4;i++) p->pending_geometry[i]=a[i].i;
             } else if (menu_mode && p->parent_id) {
@@ -1005,8 +1079,13 @@ static int shared_dispatch(const void *iface, void *target, uint32_t op, const s
     wl_resource_set_dispatcher(*out,shared_dispatch,type,p,shared_clear);
     if (type==&shell_top || type==&shell_popup) p->xdg_role=1;
     if (type==&shell_top) shared_event("OPEN",p->id);
-    else if (popup_mode && type==&shell_popup)
-        shared_write("POPUP %u %u %d %d %d %d\n",p->id,p->parent_id,p->popup_x,p->popup_y,p->popup_w,p->popup_h);
+    else if (popup_mode && type==&shell_popup) {
+        struct shared_surface *parent=parent_of(p);
+        /* The host uses the displayed buffer origin. XDG uses window geometry. */
+        int x=p->popup_x+(parent->parent_id ? 0 : parent->geometry[0]);
+        int y=p->popup_y+(parent->parent_id ? 0 : parent->geometry[1]);
+        shared_write("POPUP %u %u %d %d %d %d\n",p->id,p->parent_id,x,y,p->popup_w,p->popup_h);
+    }
     return 0;
 invalid:
     if (iface==&shell_popup && op==1)

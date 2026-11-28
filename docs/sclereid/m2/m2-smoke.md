@@ -295,9 +295,39 @@ All 66 locked GTK APKs verified after retrying incomplete downloads against an a
 
 The opening and dismissal stimuli were injected on the host-to-guest seat channel, not physical mouse events. This covers one direct child and one seat, not menu item activation, nested menus, constraint handling, clicks outside all managed windows, or display scanout.
 
+### Qt 与 Electron 初步显示
+
+Intel Mac、QEMU 11.1.3/HVF、Alpine Standard 3.22.2 来宾。两个最小应用均使用原生 Wayland，来宾提交 `wl_shm`，宿主从 DAX 读帧并提交到 AppKit 后才回 ACK。两个窗口均收到 `FRAME_OK`，关闭后收到 `CLEANUP_OK`，应用退出码均为 0。
+
+| 应用 | 来宾配置 | 显示结果 |
+|---|---|---|
+| Qt Widgets | Qt 6.8.3、PySide6、Wayland 插件 | 64×48 首帧，四象限图案的 3,072 个像素全部匹配 |
+| Electron | Alpine `edge/testing` 42.11.18-r0，`--ozone-platform=wayland --disable-gpu` | 192×138 SHM 缓冲，首帧为背景，第二帧 160×96 HTML 内容区的 15,360 个像素全部匹配 |
+
+Qt 在首次 commit 前调用 `wl_surface.set_buffer_transform(0)`。原桥缺少该处理器，连接在首帧前断开。共享桥现接受正常方向，其他变换仍拒绝。Electron 以普通用户运行，保留 Chromium 沙箱。验证脚本和日志分别保存在 `/tmp/scl-qt-probe/` 和 `/tmp/scl-electron-probe/`。
+
+### Electron 真人输入
+
+Electron 探针包含计数按钮、文本 `<input>`、原生 `<select>` 和数值步进器。页面显示最近事件，来宾串口记录 DOM 事件和控件值。探针使用 SHM、Chromium 沙箱和 M2 的 AppKit 输入路径，关闭 GPU 与 GTK IME。启动命令为 `python3 /tmp/scl-electron-probe/input-run.py`，窗口标题为 `Sclereid M2`。
+
+| 真人操作 | 结果 |
+|---|---|
+| 文本输入、Shift、退格 | Electron 收到 `isTrusted: true` 的插入和删除事件，最终提交 `Hello!!` |
+| `⌘C` 后松开 | 宿主和 Electron 均记录成对的 `KeyC` 按下与释放。修复前缺少释放并持续重复 `c` |
+| 计数按钮、数值步进器 | 计数达到 6，步进值从 2 加到 6，Electron 收到 `input` 和 `change` |
+| 展开 `<select>` 并点击选项 | 75×80 的 `xdg_popup` 映射为独立 AppKit 子窗。连续两次点击分别提交 `Bravo` 和 `Charlie`，两次均收到 `TREE_CLOSE_OK` |
+
+来宾桥接受 Chromium 在分配 popup 角色前提交的空缓冲。未抓取的子窗接收指针事件时，键盘焦点留在父窗。子窗的 Wayland 坐标为 `(22,209)`，加上父窗口几何偏移 `(16,10)` 后，以 `(38,219)` 提交给 AppKit。
+
+选项验收后，拖动选中的文本曾触发 `wl_data_device_manager.create_data_source` 的空处理器，导致来宾桥断开。现在桥保留 GTK 所需的 data device，创建惰性数据源，取消剪贴板和拖放操作，并完成已排队的拖动图标缓冲释放与帧回调。Electron 数据源创建和退出、拖动图标协议重放、GTK 菜单回归均已验证；真人拖动尚未复测，实际数据传输仍未实现。
+
+### 协议诊断侧车
+
+运行 M2 smoke 时加 `--sidecar-port 8765`，用 `curl 'http://localhost:8765/events?level=warning'` 查询。驱动通过非阻塞匿名管道发送脱敏事件，退出后仍可查询 10 分钟。对独立 C 进程可用侧车的 `--fifo` 模式，直接写入 NDJSON。接口和处置规则见 [protocol-diagnostics skill](../../../.agents/skills/protocol-diagnostics/SKILL.md)。
+
 ### 共享路径后续验收
 
-- Real Qt and Electron SHM windows on HVF; GTK has bounded toplevel, input, resize, animation and close evidence above, not general toolkit compatibility.
+- Qt 输入与 popup，Qt 和 Electron 的缩放、原生关闭回程，Qt Quick 和 Electron GPU 渲染。
 - Broader toolkit popup compatibility, nested grabs, outside clicks beyond managed windows, nested popups, movement and constraint adjustment; subsurface stacking, synchronization and teardown; real region, clipboard and drag-and-drop semantics.
 - Physical continuous edge drag, XDG resizing state and final-state delivery, and arbitrary event interleavings (including unmap or close with a frame in flight). The burst above tests scripted AppKit resize coalescing, not a drag gesture or refresh cadence.
 - Display scanout, output enter/leave and display migration, dynamic/fractional scaling, transforms and viewporter. Native 2× backing was verified separately on the i9 host.

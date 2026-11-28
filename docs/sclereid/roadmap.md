@@ -6,7 +6,7 @@
 |---|---|---|
 | M0 平台 | 本机通过 | 扩展 Intel 机型矩阵，记录 OS、QEMU、GPU 和驱动 |
 | M1 传输 | 本机选型完成 | 双槽 DAX 基线交给 M2；保留 TCP、串口和编码对照 |
-| M2 原生窗口 | Weston 单窗、共享多窗生命周期与会话重建、原生 Retina backing、GTK 双窗输入与交错 resize、多帧、GTK 右键菜单越界选择、取消、右下角翻转和七层子菜单回收通过；GTK 子菜单悬停重开和内容区拖动正向场景通过人工测试 | 嵌套屏边、Qt/Electron |
+| M2 原生窗口 | Weston 单窗、共享多窗生命周期与会话重建、原生 Retina backing、GTK 双窗输入与交错 resize、多帧、GTK 右键菜单越界选择、取消、右下角翻转和七层子菜单回收通过；GTK 子菜单悬停重开和内容区拖动正向场景通过人工测试；Qt Widgets 和 Electron 初步显示通过。Electron 的文本输入、按钮、数值步进器和独立下拉选择通过人工测试 | 嵌套屏边、Qt 输入、Qt/Electron 缩放与原生关闭、Wayland 剪贴板及数据拖放 |
 | G1 GPU | 宿主 Metal compute 通过；[线性 PRIME DMA-BUF → DAX → AppKit](research.md#来宾桥线性-prime-dma-buf-到-appkit) 四帧通过 | 原版 EGL 窗口的非 SHM 提交、EGL popup；硬件 renderer 另验 |
 | M3 应用 | 待 M2、G1 | 测 VS Code 滚动与键入、轻量 3D 的帧时间和 CPU/GPU 开销 |
 

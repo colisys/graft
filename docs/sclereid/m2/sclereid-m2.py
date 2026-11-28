@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """One-shot Intel HVF → Wayland SHM → ext4 DAX → AppKit smoke test."""
 import argparse
+from collections import Counter
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 import hashlib
+import json
 import mmap
 import os
 from pathlib import Path
+from select import PIPE_BUF
 import selectors
 import shutil
 import socket
@@ -15,10 +18,12 @@ import threading
 import math
 import re
 import subprocess as sp
+import sys
 import tempfile
 import time
 
 HERE = Path(__file__).resolve().parent
+SIDECAR = HERE.parents[2] / '.agents/skills/protocol-diagnostics/sidecar.py'
 ISO_SHA = 'f6a265f0696d328c8f87814a0d6bfa362d1434e500cb80a48796b1c9d204cee0'
 APK_BASE = 'https://dl-cdn.alpinelinux.org/alpine/v3.22/'
 PACKAGES = {
@@ -90,20 +95,162 @@ def build(work, packages, weston, gtk=False):
            cwd=work, check=True, timeout=90)
 
 
+class Diagnostics:
+    def __init__(self):
+        self.pipe = None
+        self.issues = Counter()
+
+    @contextmanager
+    def collect(self, port):
+        if port is not None:
+            try:
+                if not SIDECAR.is_file():
+                    raise FileNotFoundError(SIDECAR)
+                # No Popen context manager: it would wait for the query server.
+                proc = sp.Popen(['python3', SIDECAR, '--port', str(port)], stdin=sp.PIPE,
+                                stdout=sp.DEVNULL, stderr=sp.DEVNULL,
+                                bufsize=0, start_new_session=True)
+                self.pipe = proc.stdin
+                os.set_blocking(self.pipe.fileno(), False)
+            except (OSError, ValueError):
+                self.close()
+                with suppress(OSError):
+                    print(f'M2 diagnostics unavailable: could not start {SIDECAR}', file=sys.stderr)
+            else:
+                with suppress(OSError):
+                    print(f'M2 diagnostics URL: http://localhost:{port}/', file=sys.stderr, flush=True)
+        try:
+            yield self
+        finally:
+            for (source, level, event), count in self.issues.items():
+                self.emit(level, source, event, f'{count} matching diagnostic lines',
+                          action='inspect_local_diagnostics')
+            self.issues.clear()
+            self.close()
+
+    def close(self):
+        if self.pipe is not None:
+            with suppress(OSError):
+                self.pipe.close()
+            self.pipe = None
+
+    def emit(self, level, source, event, message, *, file='sclereid-m2.py', line=None, action=None):
+        if self.pipe is None:
+            return
+        record = (json.dumps(dict(level=level, source=source, event=event, message=message,
+                                  file=file, line=line, action=action)) + '\n').encode()
+        # With O_NONBLOCK, writes no larger than PIPE_BUF are all-or-nothing.
+        if len(record) <= PIPE_BUF:
+            try:
+                os.write(self.pipe.fileno(), record)
+            except BlockingIOError:
+                pass
+            except (OSError, ValueError):
+                self.close()
+
+    def failure(self, phase, error):
+        if self.pipe is None:
+            return
+        line = None
+        tb = error.__traceback__
+        while tb is not None:
+            if tb.tb_frame.f_code.co_filename == __file__:
+                line = tb.tb_lineno
+            tb = tb.tb_next
+        level = 'warning' if isinstance(error, KeyboardInterrupt) else 'fatal'
+        # Exception arguments and notes may contain serial tails or host input.
+        self.emit(level, 'driver', phase, f'{phase}: {type(error).__name__}',
+                  line=line, action='inspect_local_diagnostics')
+
+
+SERIAL_EVENTS = set(b'''
+    M2_MODULES_READY M2_FORMATTED M2_MOUNTED GUEST_READY BETWEEN_SESSIONS
+    GTK_WAYLAND_CONNECTED GTK_MENU_CLIENT_EXIT_OK GTK_MENU_GUEST_CLEAN GTK_CLEAN
+    FIXTURE_REPAINT_QUEUED FIXTURE_POPUP_DONE FIXTURE_TEARDOWN_QUEUED
+    FIXTURE_PARENT_FIRST_DONE ABRUPT_CLEAN SHARED_CLEAN POPUP_GUEST_CLEAN
+    GUEST_CLEANUP_OK ANIM_STATS GTK_MENU GTK_MENU_EDGE GTK_GRAB
+'''.split())
+HOST_EVENTS = set(b'''
+    WINDOW_OK RETINA_OK LAYER_OK FRAME_OK GEOMETRY REMAPPED POPUP_ORIGIN
+    PARENT_OK POPUP_OK MOVE_OK EDGE_OK TREE_POPUP_OK TREE_FRAME_OK
+    CLOSE_OK TREE_CLOSE_OK COMMAND_OK WORKAREA CLEANUP_OK
+'''.split())
+
+
+DATA_DIAG = re.compile(rb'((?:[A-Za-z]:)?[^:\r\n]+):([1-9][0-9]{0,8}) event=(\S+) disposition=(\S+)(?:[ \t].*)?')
+WAYLAND_TRACE = re.compile(rb'^\[\s*[0-9]+\.[0-9]+\]')
+DATA_DISPOSITIONS = {
+    b'wl_data_device_manager.create_data_source': {b'inert-source'},
+    b'wl_data_device.set_selection': {b'cancelled', b'already-empty'},
+    b'wl_data_device.start_drag': {b'cancelled', b'ignored-no-source', b'discard-icon', b'rejected-icon-role'},
+}
+DIAGNOSTIC_KINDS = (
+    ('fatal', 'fatal_diagnostic', re.compile(rb'\bfatal\b|\bkernel panic\b', re.I)),
+    ('error', 'protocol_error', re.compile(rb'\binvalid shared request\b|\bprotocol error\b', re.I)),
+    ('error', 'resource_error', re.compile(rb'\b(?:out of memory|no space left on device|permission denied)\b', re.I)),
+    ('error', 'error_diagnostic', re.compile(rb'\b(?:error|failed|failure|critical)\b', re.I)),
+    ('warning', 'warning_diagnostic', re.compile(rb'\b(?:warning|warn)\b', re.I)),
+)
+
+
+def observe_line(diagnostics, source, line):
+    # Only allowlisted fields and fixed diagnostic categories leave the driver.
+    line = line.rstrip(b'\r')
+    token, _, _ = line.partition(b' ')
+    if source == 'guest_serial':
+        if match := DATA_DIAG.fullmatch(line):
+            path, number, event, action = match.groups()
+            basename = path.replace(b'\\', b'/').rsplit(b'/', 1)[-1]
+            if (action in DATA_DISPOSITIONS.get(event, ())
+                    and re.fullmatch(rb'[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}', basename)):
+                level = ('error' if action == b'rejected-icon-role' else
+                                         'warning' if action in (b'cancelled', b'ignored-no-source') else 'info')
+                diagnostics.emit(level, source, event.decode('ascii'), 'Wayland data-device request',
+                                 file=basename.decode('ascii'), line=int(number), action=action.decode('ascii'))
+            return
+        if token in (b'GTK_EVENT', b'GTK_INPUT', b'GTK_HOVER', b'INPUT') or WAYLAND_TRACE.match(line):
+            return
+        if token in (b'GTK_GRAB_REJECT', b'GTK_WAYLAND_INIT_FAILED'):
+            diagnostics.emit('error', source, token.decode('ascii'), 'Guest reported a failure',
+                             action='inspect_local_diagnostics')
+
+        elif token in (b'SHARED_STALE_ACK', b'SHARED_STALE_INPUT', b'SHARED_HOST_LOST'):
+            diagnostics.emit('warning', source, token.decode('ascii'), 'Guest detected a stale request or host loss')
+        elif token in SERIAL_EVENTS:
+            diagnostics.emit('info', source, token.decode('ascii'), 'Guest serial milestone')
+        else:
+            summarize_diagnostic(diagnostics, source, line)
+    elif token in HOST_EVENTS:
+        diagnostics.emit('info', source, token.decode('ascii'), 'AppKit host milestone')
+    elif token not in (b'INPUT', b'TREE_KEY_OK', b'TREE_CLICK_OK', b'CLICK_OK'):
+        summarize_diagnostic(diagnostics, source, line)
+
+
+def summarize_diagnostic(diagnostics, source, line):
+    for level, event, pattern in DIAGNOSTIC_KINDS:
+        if pattern.search(line):
+            diagnostics.issues[source, level, event] += 1
+            break
+
+
 @contextmanager
-def child(cmd, work, **kwargs) -> Iterator[sp.Popen[bytes]]:
+def child(cmd, work, *, host_diagnostics=None, **kwargs) -> Iterator[sp.Popen[bytes]]:
     with sp.Popen[bytes](cmd, cwd=work, stdin=sp.PIPE, stdout=sp.PIPE, bufsize=0, text=False, **kwargs) as proc:
         try:
             yield proc
         finally:
-            if proc.poll() is None:
+            status = proc.poll()
+            if status is None:
                 proc.kill()
+            elif status and host_diagnostics is not None:
+                host_diagnostics.emit('error', 'host', 'nonzero_exit', f'AppKit host exited with status {status}',
+                                      action='inspect_local_diagnostics')
             proc.wait(timeout=10)
 
 
 @contextmanager
-def menu_host(cmd, work) -> Iterator[sp.Popen[bytes]]:
-    with child(cmd, work) as win:
+def menu_host(cmd, work, diagnostics=None) -> Iterator[sp.Popen[bytes]]:
+    with child(cmd, work, host_diagnostics=diagnostics) as win:
         assert win.stdin is not None
         try:
             yield win
@@ -119,9 +266,27 @@ def menu_host(cmd, work) -> Iterator[sp.Popen[bytes]]:
 
 
 class Reader:
-    def __init__(self, fd):
+    def __init__(self, fd, diagnostics=None, source=None):
         self.fd = fd
         self.buffer = b''
+        self.diagnostics = diagnostics
+        self.source = source
+        self.log_tail = b''
+        self.log_overlong = False
+
+    def read(self):
+        chunk = os.read(self.fd, 8192)
+        if chunk and self.diagnostics is not None and self.diagnostics.pipe is not None:
+            # Keep framing independent of until() markers and its control buffer.
+            lines = (self.log_tail + chunk).split(b'\n')
+            tail = lines.pop()
+            for line in lines:
+                if not self.log_overlong and len(line) <= 4096:
+                    observe_line(self.diagnostics, self.source, line)
+                self.log_overlong = False
+            self.log_overlong |= len(tail) > 4096
+            self.log_tail = b'' if self.log_overlong else tail
+        return chunk
 
     def until(self, marker, timeout):
         end = time.monotonic() + timeout
@@ -130,7 +295,7 @@ class Reader:
             while marker not in self.buffer:
                 if not sel.select(max(0, end - time.monotonic())):
                     raise TimeoutError(f'waiting for {marker!r}: {self.buffer[-3000:]!r}')
-                chunk = os.read(self.fd, 8192)
+                chunk = self.read()
                 if not chunk:
                     raise EOFError(f'waiting for {marker!r}: {self.buffer[-3000:]!r}')
                 self.buffer = (self.buffer + chunk)[-65536:]
@@ -346,7 +511,7 @@ def shared_smoke(work, vm, port, region, console, override, poweroff=True, sessi
             stack.callback(join_forwarder)
             with tx:
                 win = stack.enter_context(child([work / 'window', '--weston'], work,
-                    env={**os.environ, 'M2_INPUT_FD': str(tx.fileno()),
+                    host_diagnostics=console.diagnostics, env={**os.environ, 'M2_INPUT_FD': str(tx.fileno()),
                          'M2_VERIFY_PIXELS': '0' if gtk else '1', **extra_env}, pass_fds=(tx.fileno(),)))
             def forward():
                 with rx.makefile('rb') as events:
@@ -362,7 +527,7 @@ def shared_smoke(work, vm, port, region, console, override, poweroff=True, sessi
             thread = threading.Thread(target=forward, daemon=True)
             thread.start()
             assert win.stdout is not None
-            windows[sid] = win, Reader(win.stdout.fileno())
+            windows[sid] = win, Reader(win.stdout.fileno(), console.diagnostics, 'host')
             return sid
         def pixels(expected, seq, width=64, height=48, remap=False, origin=None, overlay=None, expected_scale=advertised):
             packet = line()
@@ -774,8 +939,8 @@ def popup_smoke(work, vm, port, region, console):
         b'set -- /dev/vport*p1; exec 3<>"$1"; /tmp/bridge/bridge shared-popup <&3 >&3 & server=$!; '
         b'for i in 1 2 3 4 5; do test -S /tmp/m2/m2 && break; sleep 1; done; '
         b'/tmp/bridge/bridge client-popup 3>&- && wait "$server" && test ! -e /tmp/m2/m2 && echo POPUP_GUEST_CLEAN)\n')
-    with child([work / 'window', '--popup-host'], work) as win:
-        report = Reader(win.stdout.fileno())
+    with child([work / 'window', '--popup-host'], work, host_diagnostics=console.diagnostics) as win:
+        report = Reader(win.stdout.fileno(), console.diagnostics, 'host')
         slots = set()
 
         def expect(pattern):
@@ -863,8 +1028,8 @@ def gtk_menu_smoke(work, vm, port, region, console, edge=False, tree=False, hove
         port.sendall(('\n'.join(commands) + '\n').encode('ascii'))
 
     host_mode = '--menu-input-host' if menu_input else '--menu-tree-host' if tree else '--menu-host'
-    with menu_host([work / 'window', host_mode], work) as win:
-        report = Reader(win.stdout.fileno())
+    with menu_host([work / 'window', host_mode], work, console.diagnostics) as win:
+        report = Reader(win.stdout.fileno(), console.diagnostics, 'host')
 
         def host_line(timeout):
             actual = report.until(b'\n', timeout).decode('ascii')
@@ -1048,7 +1213,7 @@ def gtk_menu_smoke(work, vm, port, region, console, edge=False, tree=False, hove
                     buffered = b'\n' in stream.buffer or b'\n' in console.buffer
                     for key, _ in sel.select(0 if buffered else remaining):
                         reader = key.data
-                        chunk = os.read(reader.fd, 8192)
+                        chunk = reader.read()
                         if not chunk:
                             raise EOFError(f'GTK hover waiting for {pattern!r}: fd {reader.fd} closed')
                         reader.buffer += chunk
@@ -1111,7 +1276,7 @@ def gtk_menu_smoke(work, vm, port, region, console, edge=False, tree=False, hove
                         buffered = any(b'\n' in r.buffer for r in readers)
                         for key, _ in sel.select(0 if buffered else remaining):
                             reader = key.data
-                            chunk = os.read(reader.fd, 8192)
+                            chunk = reader.read()
                             if not chunk:
                                 raise EOFError(f'{description}: fd {reader.fd} closed')
                             reader.buffer += chunk
@@ -1438,7 +1603,7 @@ def vm_command(work, iso, ports=1, *, block_payload=False):
     return cmd
 
 
-def run(work, iso, animate, slots, seconds, weston, disconnect=False, retina=False, shared=False, reconnect=False, output_scale=None, gtk=False, popup=False, gtk_menu=False, gtk_menu_edge=False, gtk_menu_tree=False, gtk_menu_tree_hover=False, gtk_menu_input=False, manual=False, menu_depth=2, hover_from=None, wayland_trace=False):
+def run(work, iso, animate, slots, seconds, weston, disconnect=False, retina=False, shared=False, reconnect=False, output_scale=None, gtk=False, popup=False, gtk_menu=False, gtk_menu_edge=False, gtk_menu_tree=False, gtk_menu_tree_hover=False, gtk_menu_input=False, manual=False, menu_depth=2, hover_from=None, wayland_trace=False, *, diagnostics=None):
     tree = gtk_menu_tree or gtk_menu_tree_hover or gtk_menu_input
     menu = gtk_menu or gtk_menu_edge or tree
     cmd = vm_command(work, iso, block_payload=True)
@@ -1450,7 +1615,7 @@ def run(work, iso, animate, slots, seconds, weston, disconnect=False, retina=Fal
         file.truncate(REGION_BYTES)
         with mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as region, child(cmd, work) as vm:
             assert vm.stdin is not None and vm.stdout is not None
-            console = Reader(vm.stdout.fileno())
+            console = Reader(vm.stdout.fileno(), diagnostics, 'guest_serial')
             console.until(b'localhost login:', 90)
             vm.stdin.write(b'root\n')
             console.until(b'localhost:~# ', 10)
@@ -1516,9 +1681,9 @@ def run(work, iso, animate, slots, seconds, weston, disconnect=False, retina=Fal
                     b'echo GUEST_CLEANUP_OK)\n')
                 frame_port = Reader(port.fileno())
                 window_args = ['--animate'] if animate else ['--weston'] if weston else ['--retina'] if retina else []
-                with child([work / 'window', *window_args], work) as window:
+                with child([work / 'window', *window_args], work, host_diagnostics=diagnostics) as window:
                     assert window.stdin is not None and window.stdout is not None
-                    report = Reader(window.stdout.fileno())
+                    report = Reader(window.stdout.fileno(), diagnostics, 'host')
                     if weston:
                         try:
                             play_weston(port, frame_port, region, window, report,
@@ -1602,7 +1767,11 @@ def main():
     parser.add_argument('--disconnect', action='store_true', help='with --weston, stop QEMU; with --shared, drop the frame port and reconnect; with --gtk, terminate the client with frames pending')
     parser.add_argument('--output-scale', type=int, choices=(1, 2), help='override shared output advertisement (default: AppKit backing)')
     parser.add_argument('--reconnect', action='store_true', help='with --shared, reconnect after draining the session')
+    parser.add_argument('--sidecar-port', type=int, metavar='PORT',
+                        help='start the optional protocol diagnostics sidecar on PORT')
     args = parser.parse_args()
+    if args.sidecar_port is not None and not 1 <= args.sidecar_port <= 65535:
+        parser.error('--sidecar-port requires a port in 1–65535')
     if args.menu_depth is not None and not args.gtk_menu_input: parser.error('--menu-depth requires --gtk-menu-input')
     if args.hover_from is not None and (not args.gtk_menu_input or args.manual or not 1 <= args.hover_from < (args.menu_depth or 2)):
         parser.error('--hover-from requires synthetic --gtk-menu-input and a level before the leaf')
@@ -1615,18 +1784,27 @@ def main():
         parser.error('--disconnect requires --weston, --shared, or --gtk')
     if not 1 <= args.seconds <= 30 or (not args.animate and (args.slots != 1 or args.seconds != 3)):
         parser.error('--slots and --seconds are animation options; require 1–30 seconds')
-    iso = args.iso.resolve(strict=True)
-    verify(iso, ISO_SHA)
-    # Short directory keeps the virtio-serial Unix socket under macOS sun_path limits.
-    with tempfile.TemporaryDirectory(prefix='scl-m2-', dir=os.environ.get('COMMANDCODE_SCRATCHPAD', '/tmp')) as directory:
-        work = Path(directory)
-        build(work, args.apks, args.weston,
-              args.gtk or args.gtk_menu or args.gtk_menu_edge or args.gtk_menu_tree or args.gtk_menu_tree_hover or args.gtk_menu_input)
-        run(work, iso, args.animate, args.slots, args.seconds, args.weston, args.disconnect, args.retina,
-            args.shared, args.reconnect, args.output_scale, args.gtk, args.popup, gtk_menu=args.gtk_menu, gtk_menu_edge=args.gtk_menu_edge,
-            gtk_menu_tree=args.gtk_menu_tree, gtk_menu_tree_hover=args.gtk_menu_tree_hover, gtk_menu_input=args.gtk_menu_input, manual=args.manual, menu_depth=args.menu_depth or 2,
-                        hover_from=args.hover_from, wayland_trace=args.wayland_trace)
-    print('SCLEREID_M2_OK', flush=True)
+    with Diagnostics().collect(args.sidecar_port) as diagnostics:
+        phase = 'verify_iso'
+        try:
+            iso = args.iso.resolve(strict=True)
+            verify(iso, ISO_SHA)
+            phase = 'build'
+            # Short directory keeps the virtio-serial Unix socket under macOS sun_path limits.
+            with tempfile.TemporaryDirectory(prefix='scl-m2-', dir=os.environ.get('COMMANDCODE_SCRATCHPAD', '/tmp')) as directory:
+                work = Path(directory)
+                build(work, args.apks, args.weston,
+                      args.gtk or args.gtk_menu or args.gtk_menu_edge or args.gtk_menu_tree or args.gtk_menu_tree_hover or args.gtk_menu_input)
+                phase = 'run'
+                run(work, iso, args.animate, args.slots, args.seconds, args.weston, args.disconnect, args.retina,
+                    args.shared, args.reconnect, args.output_scale, args.gtk, args.popup, gtk_menu=args.gtk_menu, gtk_menu_edge=args.gtk_menu_edge,
+                    gtk_menu_tree=args.gtk_menu_tree, gtk_menu_tree_hover=args.gtk_menu_tree_hover, gtk_menu_input=args.gtk_menu_input, manual=args.manual, menu_depth=args.menu_depth or 2,
+                    hover_from=args.hover_from, wayland_trace=args.wayland_trace, diagnostics=diagnostics)
+            print('SCLEREID_M2_OK', flush=True)
+            diagnostics.emit('info', 'driver', 'SCLEREID_M2_OK', 'Smoke test completed')
+        except (Exception, KeyboardInterrupt) as error:
+            diagnostics.failure(phase, error)
+            raise
 
 
 if __name__ == '__main__':
