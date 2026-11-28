@@ -126,7 +126,7 @@ def main():
             port.settimeout(15)
             port.connect(str(work / ('frames' if not i else f'frames{i}')))
             ports.append(port)
-        vm.stdin.write(b'modprobe virtio_pmem && modprobe nd_pmem && modprobe ext4 && modprobe virtio_console && modprobe qemu_fw_cfg && mdev -s && apk add --no-network e2fsprogs && mkfs.ext4 -F -b 4096 /dev/pmem0 && mount -t ext4 -o dax=always /dev/pmem0 /mnt && mkdir -m 700 /tmp/bridge /tmp/m2 && tar -xf /sys/firmware/qemu_fw_cfg/by_name/opt/sclereid/m2/raw -C /tmp/bridge && echo GUEST_READY\n')
+        vm.stdin.write(b'modprobe virtio_pmem && modprobe nd_pmem && modprobe ext4 && modprobe virtio_console && modprobe qemu_fw_cfg && mdev -s && apk add --no-network e2fsprogs && mkfs.ext4 -F -b 4096 /dev/pmem0 && mount -t ext4 -o dax=always /dev/pmem0 /mnt && mkdir -m 700 /tmp/bridge /tmp/m2 && tar -xzf /sys/firmware/qemu_fw_cfg/by_name/opt/sclereid/m2/raw -C /tmp/bridge && echo GUEST_READY\n')
         console.until(b'GUEST_READY\r\n', 60)
         for n in args.instances:
             with ExitStack() as group:

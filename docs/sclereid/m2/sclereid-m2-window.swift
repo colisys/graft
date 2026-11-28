@@ -19,7 +19,8 @@ private final class FrameView: NSView {
 
     init(image: CGImage) {
         self.image = image
-        super.init(frame: NSMakeRect(0, 0, CGFloat(width * 4), CGFloat(height * 4)))
+        let factor: CGFloat = CommandLine.arguments.contains("--retina") ? 0.5 : 4
+        super.init(frame: NSMakeRect(0, 0, CGFloat(width) * factor, CGFloat(height) * factor))
     }
 
     required init?(coder: NSCoder) { fatalError("not loaded from a nib") }
@@ -35,7 +36,7 @@ private final class FrameView: NSView {
         guard let snapshot = bitmapImageRepForCachingDisplay(in: bounds)?.retagging(with: .sRGB) else { fail("no view bitmap") }
         cacheDisplay(in: bounds, to: snapshot)
         let w = snapshot.pixelsWide, h = snapshot.pixelsHigh
-        guard w >= width, h >= height else { fail("undersized view bitmap") }
+        guard w >= Int(bounds.width), h >= Int(bounds.height) else { fail("undersized view bitmap") }
         // Sample the center of every source pixel's rendered footprint, including on Retina.
         guard snapshot.bitsPerSample == 8, snapshot.samplesPerPixel == 4 else { fail("unexpected cache format") }
         var pixel = [Int](repeating: 0, count: 4)
@@ -59,14 +60,28 @@ private var windowEvents: WindowEvents?
 private final class WindowEvents: NSObject, NSWindowDelegate {
     var size: NSSize?
     var closeRequested = false
+    var applyingFrame = false
 
     func windowDidResize(_ notification: Notification) {
         guard let w = notification.object as? NSWindow else { return }
-        size = w.contentView?.bounds.size
+        guard !applyingFrame, let view = w.contentView else { return }
+        if let seat = view as? SeatView {
+            if w.isVisible { seat.input("R \(Int(view.bounds.width)) \(Int(view.bounds.height))") }
+        } else {
+            size = view.bounds.size
+        }
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        ((notification.object as? NSWindow)?.contentView as? SeatView)?.input("L 0")
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        closeRequested = true
+        if let view = sender.contentView as? SeatView {
+            view.input("C 0")
+        } else {
+            closeRequested = true
+        }
         return false // The client owns its shutdown; EOF closes the native window.
     }
 
@@ -125,30 +140,86 @@ private func show(_ frame: Data) {
     let w = openWindow(view)
     view.verify()
     guard w.isVisible, onScreen(w.windowNumber) else { fail("window is not ordered on screen") }
+    if CommandLine.arguments.contains("--retina") {
+        let backing = view.convertToBacking(view.bounds).size
+        guard view.bounds.size == NSSize(width: 32, height: 24), backing.width == 32 * w.backingScaleFactor, backing.height == 24 * w.backingScaleFactor else { fail("unexpected Retina geometry: \(view.bounds.size), \(backing)") }
+        report("RETINA_OK logical=32x24 backing=\(Int(backing.width))x\(Int(backing.height)) buffer=64x48")
+    }
     report("WINDOW_OK")
 }
 
-private func animate(_ frame: Data, width: Int, height: Int, interactive: Bool = false) {
+private final class SeatView: NSView {
+    override var acceptsFirstResponder: Bool { true }
+    override var isFlipped: Bool { true }
+    func input(_ text: String) {
+        guard let value = ProcessInfo.processInfo.environment["M2_INPUT_FD"], let fd = Int32(value) else { return }
+        let line = text + "\n"
+        if line.withCString({ write(fd, $0, line.utf8.count) }) != line.utf8.count { fail("input channel") }
+    }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseMoved(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        if bounds.contains(p) { input("M \(Int(p.x)) \(Int(p.y))") }
+    }
+    override func mouseDragged(with event: NSEvent) { mouseMoved(with: event) }
+    override func mouseDown(with event: NSEvent) { mouseMoved(with: event); input("B 1") }
+    override func mouseUp(with event: NSEvent) { input("B 0") }
+    private let codes: [UInt16: Int] = [0:30,1:31,2:32,3:33,4:35,5:34,6:44,7:45,8:46,9:47,
+        11:48,12:16,13:17,14:18,15:19,16:21,17:20,31:24,32:22,34:23,35:25,36:28,
+        37:38,38:36,40:37,45:49,46:50,48:15,49:57,51:14,53:1,123:105,124:106,125:108,126:103]
+    override func flagsChanged(with event: NSEvent) {
+        if event.keyCode == 56 { input("K 42 \(event.modifierFlags.contains(.shift) ? 1 : 0)") }
+    }
+    override func keyDown(with event: NSEvent) {
+        if let code = codes[event.keyCode], !event.isARepeat { input("K \(code) 1") }
+    }
+    override func keyUp(with event: NSEvent) {
+        if let code = codes[event.keyCode] { input("K \(code) 0") }
+    }
+}
+
+private func animate(_ frame: Data, width: Int, height: Int, interactive: Bool = false, scale: Int = 1) {
     let first = window == nil
     if first {
-        let view = NSView(frame: NSMakeRect(0, 0, CGFloat(width), CGFloat(height)))
+        let rect = NSMakeRect(0, 0, CGFloat(width / scale), CGFloat(height / scale))
+        let view = ProcessInfo.processInfo.environment["M2_INPUT_FD"] == nil ? NSView(frame: rect) : SeatView(frame: rect)
         // Install a layer-hosting view so AppKit doesn't redraw over its contents.
         view.layer = CALayer()
         view.wantsLayer = true
-        _ = openWindow(view, interactive: interactive)
+        let w = openWindow(view, interactive: interactive)
+        if view is SeatView { w.acceptsMouseMovedEvents = true; w.makeFirstResponder(view) }
     }
     guard let w = window, let layer = w.contentView?.layer else { fail("missing animation layer") }
+    if let view = w.contentView as? SeatView {
+        let target = NSSize(width: width / scale, height: height / scale)
+        if view.bounds.size != target {
+            windowEvents?.applyingFrame = true
+            w.setContentSize(target)
+            windowEvents?.applyingFrame = false
+        }
+    }
     let start = CACurrentMediaTime()
     let image = makeImage(frame, width: width, height: height)
     let constructed = CACurrentMediaTime()
     CATransaction.begin()
     CATransaction.setDisableActions(true)
+    layer.contentsScale = CGFloat(scale)
     layer.contents = image
     CATransaction.commit()
     // This measures submission, not when the frame reaches the display.
     CATransaction.flush()
     let applied = CACurrentMediaTime()
     if first && !(w.isVisible && onScreen(w.windowNumber)) { fail("window is not ordered on screen") }
+    if let view = w.contentView as? SeatView {
+        if !w.isVisible {
+            w.orderFrontRegardless()
+            w.display()
+            guard w.isVisible, onScreen(w.windowNumber) else { fail("remapped window is not on screen") }
+            report("REMAPPED")
+        }
+        let backing = view.convertToBacking(view.bounds)
+        report("GEOMETRY \(Int(view.bounds.width)) \(Int(view.bounds.height)) backing \(Int(backing.width)) \(Int(backing.height))")
+    }
     windowEvents?.flush()
     report(String(format: "FRAME_OK %.6f %.6f", (constructed - start) * 1000, (applied - constructed) * 1000))
 }
@@ -197,16 +268,40 @@ private func receiveXDG() {
                 guard let window, let events = windowEvents else { fail("window command before first frame") }
                 if h == 1 { window.setContentSize(NSSize(width: 320, height: 280)) }
                 else if h == 2 { window.performClose(nil) }
-                else { fail("unknown window command") }
+                else if h == 3, window.contentView is SeatView {
+                    for type: NSEvent.EventType in [.leftMouseDown, .leftMouseUp] {
+                        window.sendEvent(NSEvent.mouseEvent(with: type, location: NSPoint(x: 11, y: window.contentView!.bounds.height - 8), modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
+                    }
+                    func shift(_ flags: NSEvent.ModifierFlags) {
+                        window.sendEvent(NSEvent.keyEvent(with: .flagsChanged, location: .zero, modifierFlags: flags, timestamp: 0, windowNumber: window.windowNumber, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 56)!)
+                    }
+                    shift(.shift)
+                    for type: NSEvent.EventType in [.keyDown, .keyUp] {
+                        window.sendEvent(NSEvent.keyEvent(with: type, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil, characters: "a", charactersIgnoringModifiers: "a", isARepeat: false, keyCode: 0)!)
+                    }
+                    shift([])
+                } else if h == 4, let view = window.contentView as? SeatView {
+                    let id = window.windowNumber
+                    view.layer?.contents = nil
+                    window.orderOut(nil)
+                    guard !window.isVisible, !onScreen(id) else { fail("unmapped window is still on screen") }
+                } else if h == 5, window.contentView is SeatView {
+                    window.setContentSize(NSSize(width: 160, height: 120))
+                } else { fail("unknown window command") }
                 events.flush()
                 report("COMMAND_OK")
             }
             continue
         }
+        var scale = 1
+        if ProcessInfo.processInfo.environment["M2_INPUT_FD"] != nil {
+            guard let field = readBytes(2), (1...2).contains(Int(field[0])), field[1] == 0 else { fail("scale field") }
+            scale = Int(field[0])
+        }
         guard (1...640).contains(w), (1...480).contains(h),
               let frame = readFrame(width: w, height: h, opaque: false) else { fail("invalid XDG frame") }
         DispatchQueue.main.sync {
-            autoreleasepool { animate(frame, width: w, height: h, interactive: true) }
+            autoreleasepool { animate(frame, width: w, height: h, interactive: true, scale: scale) }
         }
     }
 }
@@ -247,13 +342,20 @@ private func receive(streamSize: (Int, Int)?, xdg: Bool) {
 }
 
 let app = NSApplication.shared
+if CommandLine.arguments.dropFirst().elementsEqual(["--backing-scale"]) {
+    guard let factor = NSScreen.main?.backingScaleFactor, factor == 1 || factor == 2 else {
+        fail("expected a main screen with 1x or 2x backing")
+    }
+    report(String(Int(factor)))
+    exit(0)
+}
 app.setActivationPolicy(.accessory)
 let streamSize: (Int, Int)?
 let xdg = CommandLine.arguments.dropFirst().elementsEqual(["--weston"])
 switch Array(CommandLine.arguments.dropFirst()) {
 case ["--animate"]: streamSize = (animationWidth, animationHeight)
 case ["--weston"]: streamSize = nil
-case []: streamSize = nil
+case [], ["--retina"]: streamSize = nil
 default: fail("expected --animate or --weston")
 }
 DispatchQueue.global().async { receive(streamSize: streamSize, xdg: xdg) }
