@@ -29,6 +29,28 @@ rutabaga 的 Vulkan + Wayland 路径另有 Linux 参考要求：host 6.13+、gue
 | Guest 渲染 | 核对 Colima/Lima 的 VMM 与有效配置；检查 virtio-gpu、`/dev/dri/renderD*`、capset、容器权限。用 EGL、`glxinfo -B`（GLX 对照）或 `vulkaninfo --summary` 检查驱动，配合离屏回读和宿主 GPU 活动。 |
 | 跨 VM 呈现 | 在同机验证双窗、同步和退出重连，与软件路径比较帧时间和内存峰值。零拷贝路径逐项验证格式/modifier、资源导入、生产者 fence、消费完成及回收；否则保留复制路径。 |
 
+## 本机 OpenGL/EGL 缓冲验证
+
+Intel i9-9980HK / macOS 14.8.9 / QEMU 11.1.3 HVF，Alpine 3.22.2、Mesa 25.1.9、Weston 14.0.2。`-vga none -device virtio-gpu-pci -display none` 下出现 `card0` 和 `renderD128`，内核报告 `-virgl -resource_blob`、capset 数 0；本机 QEMU 不提供 `virtio-gpu-gl-pci`。
+
+| 组合 | 拿到的证据 |
+|---|---|
+| Sclereid + 原版 `weston-simple-egl` | 成功到达窗口提交，但主窗口是 `wl_shm_pool.create_buffer` 创建的 250×250、stride 1000 缓冲；同一 `wl_buffer` 被 attach 和 commit。 |
+| Sclereid + `weston-simple-dmabuf-egl` | `No zwp_linux_dmabuf global`；在协商阶段退出，没有向桥提交 DMA-BUF，也没有发生导入失败。 |
+| Weston headless / DRM + 默认 `weston-simple-egl` | 发布 DMA-BUF global，但主窗口仍选择 SHM。 |
+| Weston headless + `kms_swrast` | 未加诊断探针时，render node 上的 `CREATE_DUMB` 被拒绝，Mesa 报 `EGL_BAD_ALLOC`。 |
+| Weston headless + `kms_swrast` + 临时来宾 fd 探针 | 探针在 `CREATE_DUMB` 时改用 `card0`。原版 EGL 窗口的 Mesa 队列实际发出 DMA-BUF `create_immed`，同一缓冲随后 attach/commit；约 2 秒内记录 68 次 `wl_buffer.release`。 |
+
+最后一行是真实非 SHM 窗口 swap 对照，不是 `glReadPixels`，也不是硬件加速、吞吐基准或 AppKit 呈现。临时复现产物和 trace 保留在本机 `/tmp/scl-egl-run/`：`python3 run.py` 重跑，`swap.log` 的 `TEST-headless-kms` 段有完整缓冲来源与提交证据；`default.log`、`forced.log` 记录无探针对照。探针只用于对照，不作为交付依赖。
+
+### 来宾桥：线性 PRIME DMA-BUF 到 AppKit
+
+共享来宾桥设置 `M2_DMABUF=1` 后发布 `zwp_linux_dmabuf_v1` v4，当前只导入单平面、显式 `LINEAR` 的 `XRGB8888`。Linux fd 留在来宾；桥检查尺寸、offset、stride 和 fd 范围，在 `DMA_BUF_IOCTL_SYNC` 的 `START/END READ` 之间把像素复制到 DAX，补齐不透明 alpha，复制完成后释放 `wl_buffer`。DAX 槽仍等宿主 ACK 才重用。默认不发布 DMA-BUF global，SHM 路径不变。
+
+本机以 DRM dumb buffer 导出的 PRIME fd 验证。64×48、offset 324、stride 320，行有效部分 256 字节；同一 `wl_buffer` 重用 4 次。四帧源 X 字节分别为 37、74、111、148；宿主按 alpha 255 逐帧比对全部 12,288 个 BGRA 字节，通过后交给真实 AppKit 窗口，四帧都收到 `FRAME_OK`。来宾每帧收到 buffer release 和帧回调才重写缓冲。临时复现：`python3 /tmp/scl-dma-e2e/run.py`；`host.log`、`serial.log` 在同目录。
+
+原版 `weston-simple-egl` 默认仍以 SHM 到达 AppKit。强制 `kms_swrast` 时，render node 的 `CREATE_DUMB` 返回 `EACCES`；诊断探针切换到 `card0` 后，分配和映射成功，但 `eglSwapBuffers` 报 `EGL_BAD_ALLOC`，跟踪中未见 PRIME 导出或 Wayland `create_params`。因此已验的是 **PRIME 导入和原生窗口呈现**，不是 EGL 的 DMA-BUF 端到端。下一步定位 Mesa 在提交前的失败分支，随后验证 EGL popup；不以放宽 modifier、同步检查或 SHM 回退代替。
+
 ## 许可证与分发
 
 Graft 为 GPL-3.0-or-later。发版前按仅调用、链接和随包分发列出组件版本、构建选项、许可证、通知文件和对应源码。guest 镜像也计入交付物。

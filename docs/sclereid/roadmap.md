@@ -6,8 +6,8 @@
 |---|---|---|
 | M0 平台 | 本机通过 | 扩展 Intel 机型矩阵，记录 OS、QEMU、GPU 和驱动 |
 | M1 传输 | 本机选型完成 | 双槽 DAX 基线交给 M2；保留 TCP、串口和编码对照 |
-| M2 原生窗口 | Weston 单窗 resize/关闭和 VM 断链清理通过；共享 compositor 夹具通过 resize、unmap/remap、输入、关闭和会话重建 | 真实工具包兼容、原生 Retina、连续拖动与更多窗口事件交错 |
-| G1 GPU | 宿主 Metal compute 探针通过 | 确认 guest 硬件 renderer、宿主 API 和跨端呈现 |
+| M2 原生窗口 | Weston 单窗、共享多窗生命周期与会话重建、原生 Retina backing、GTK 双窗输入与交错 resize、多帧、GTK 右键菜单越界选择、取消、右下角翻转和七层子菜单回收通过；GTK 子菜单悬停重开和内容区拖动正向场景通过人工测试 | 嵌套屏边、Qt/Electron |
+| G1 GPU | 宿主 Metal compute 通过；[线性 PRIME DMA-BUF → DAX → AppKit](research.md#来宾桥线性-prime-dma-buf-到-appkit) 四帧通过 | 原版 EGL 窗口的非 SHM 提交、EGL popup；硬件 renderer 另验 |
 | M3 应用 | 待 M2、G1 | 测 VS Code 滚动与键入、轻量 3D 的帧时间和 CPU/GPU 开销 |
 
 ## M0 平台基线
@@ -20,9 +20,21 @@
 
 [i9 本机数据](m1/m1-memory.md#local-m1-acceptance)：1080p BGRA 为 474.51–474.58 MiB/s，256×256 局部更新为 15.00 MiB/s。对照：[virtio-serial](m1/m1-serial.md)、[virtio-net TCP](m1/m1-net.md)、[流式 H.264](m1/m1-live-h264.md)。
 
-## M2 进展：单窗与单 VM 多窗
+## M2：本机 SHM 窗口与 GTK 菜单基线通过
 
-[复现与结果](m2/m2-smoke.md)：Linux Wayland SHM → DAX → macOS AppKit。已验证固定图案、[连续动画](m2/m2-smoke.md#动画基准)和[原版 Weston 客户端](m2/m2-smoke.md#真实客户端weston-simple-shm)的 `xdg-shell` 配置、resize 与原生关闭回程；[异常断链](m2/m2-smoke.md#异常断链)已覆盖 VM 突然退出后的窗口回收。[单 VM 多窗](m2/m2-smoke.md#单-vm-多窗)的 1–8 窗测试中，每窗平均提交率从 59.60 降至 58.75 FPS。[共享窗口生命周期](m2/m2-smoke.md#共享窗口resizeunmapremap)已实测 AppKit resize 回程、显式 NULL attach 隐藏与同 surface remap；共享模式已验收 GTK 双窗及有在途帧时的 resize 合并；[无 grab 的单层 popup](m2/m2-smoke.md#bounded-xdg-popup-intel-hvf)已验证父窗口相对几何和父窗口 unmap 时回收；[同步 subsurface](m2/m2-smoke.md#synchronized-direct-subsurface-intel-hvf) 已验证无新父缓冲时单层不透明子表面的合成、移动裁切、更新与销毁后重绘；[GTK 单层菜单](m2/m2-smoke.md#gtk-menu-closeout-checkpoint)已验证 grab、原生菜单帧和父窗外部点击回收；层叠、Qt、Electron、通用 popup/subsurface 和物理拖动仍待验收。见 [M2 剩余验收](m2/m2-smoke.md#remaining-m2-acceptance)。下一步补窗口协议兼容，再微调槽深和节拍。默认显示后端仍是 XQuartz。
+[复现与结果](m2/m2-smoke.md)：Linux Wayland SHM → DAX → macOS AppKit。[连续动画](m2/m2-smoke.md#动画基准)及[原版 Weston](m2/m2-smoke.md#真实客户端weston-simple-shm)的单窗 resize、原生关闭和 [VM 断链清理](m2/m2-smoke.md#异常断链)已验证。[单 VM 1–8 窗性能](m2/m2-smoke.md#单-vm-多窗)使用每客户端独立桥，每窗平均提交率从 59.60 降至 58.75 FPS；不是共享 compositor 的性能数据。
+
+共享 compositor 已验证输入、客户端崩溃隔离、[resize/unmap/remap/关闭](m2/m2-smoke.md#共享窗口resizeunmapremap)及[断链后同 VM 新会话](m2/m2-smoke.md#共享帧端口意外断开同-vm-新会话)。i9 主屏实测原生 Retina backing 2×，[GTK 双窗](m2/m2-smoke.md#gtk-3共享-compositor-双窗)在同一块屏上通过默认 2× 和覆盖 1× 的来宾缓冲验收。两档比例下均通过 GTK 输入和未回执时的双窗 resize 合并。[独立 popup](m2/m2-smoke.md#popup超出父窗的原生子窗口)已通过无边框 AppKit 子窗越界呈现。[GTK 右键菜单](m2/m2-smoke.md#gtk-3右键菜单选择与取消)通过 grab、父框外选择和点击父窗取消（不穿透）；[屏边用例](m2/m2-smoke.md#gtk-3菜单屏边定位)通过右下角双轴翻转。非 SHM 的 EGL 帧导入归 G1。默认显示后端仍是 XQuartz。
+
+共享验收还覆盖[同步 subsurface](m2/m2-smoke.md#synchronized-direct-subsurface-intel-hvf)的合成、移动裁切和父窗先销毁，以及 [GTK 双窗动画与逐窗原生关闭](m2/m2-smoke.md#gtk-frame-clock-animation-and-per-window-native-close-intel-hvf)。
+
+### 菜单后续
+
+[GTK 多层菜单](m2/m2-smoke.md#gtk-3多层菜单)按父子链处理，合成端到端已验证单主窗和七层菜单（八个共享 DAX 槽）。[窗口级键鼠透传](m2/m2-smoke.md#gtk-3窗口级键鼠透传)已接通，焦点切换和菜单导航通过合成端到端验收。[回撤后悬停重开](m2/m2-smoke.md#真人输入反馈与回归)已在本机通过（`--gtk-menu-input --menu-depth 7 --hover-from 2`）：Left 退到第二层后，悬停重开到第七层并点击叶项。三层探针已复现并修复鼠标按下 serial 在子菜单关闭后被 GTK 复用导致的协议错误。点击分支后的悬停重开已通过本机真人复验，无报错，正常退出。[七层菜单展开时断链](m2/m2-smoke.md#七层菜单展开时断链)已验证宿主子窗、来宾会话和未回执 DAX 槽的清理。[GTK 内容区拖动](m2/m2-smoke.md#gtk-窗口内容区拖动)已通过合成端到端探针和本机人工正向测试。嵌套菜单贴边仍待验证。原生 `NSMenu` 映射列为后续可选优化：只对来宾明确提供菜单模型和 action 的应用使用，动作仍由来宾执行；仅有 Wayland surface、含自绘内容或无法完整描述的菜单继续使用 AppKit 子窗呈现来宾像素。本阶段不实现 `NSMenu`。
+
+### 跨 VM 协议落地
+
+[正式协议选型](architecture.md#两套协议的边界)：使用带长度前缀的 Protobuf 传输帧通知、回执和控制，像素仍走 DAX，不默认压缩。先用同一组输入、焦点切换、菜单回撤重开和帧 ACK 序列对照文本与二进制，核对事件顺序、serial 和结果，再验证拆包、粘包、超长消息与版本不匹配。字节数和 CPU 开销记录为观测值，不预设 FPS 收益。当前 M2 仍使用文本协议。
 
 ## 性能测量
 

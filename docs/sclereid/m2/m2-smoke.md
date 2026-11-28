@@ -96,7 +96,7 @@ python3 docs/sclereid/m2/sclereid-m2-scale.py "$iso" --instances 1 2 4 8 --secon
 
 ### 2× SHM 缓冲探针
 
-`python3 docs/sclereid/m2/sclereid-m2.py "$iso" --retina --apks "$cache"` 在单帧客户端绑定 v3 compositor，提交 `wl_surface.set_buffer_scale(2)`。本机 HVF 实测：`DAX_FRAME_OK: 12288 bytes verified`、`RETINA_OK logical=32x24 backing=32x24 buffer=64x48`、`WINDOW_OK`、`CLEANUP_OK`、`SCLEREID_M2_OK`。64×48 是来宾物理缓冲尺寸，不是此屏幕的 backing 尺寸；本轮屏幕为 1×。该夹具不协商 `wl_output.scale`，也不验证 Weston、输入或多窗口。
+`python3 docs/sclereid/m2/sclereid-m2.py "$iso" --retina --apks "$cache"` 在单帧客户端绑定 v3 compositor，提交 `wl_surface.set_buffer_scale(2)`。Intel i9-9980HK / macOS 14.8.9 / QEMU 11.1.3 HVF，主屏 backing 2×，实测 `RETINA_OK logical=32x24 backing=64x48 buffer=64x48`、`WINDOW_OK`、`CLEANUP_OK`、`SCLEREID_M2_OK`。此夹具固定提交 2× SHM 缓冲；默认 `wl_output.scale` 跟随 AppKit backing 的行为由下面的共享模式验证。
 
 ### 共享 compositor：客户端崩溃隔离
 
@@ -125,7 +125,9 @@ python3 docs/sclereid/m2/sclereid-m2.py "$iso" --shared --output-scale 2 --apks 
 
 本机 HVF 实测：主屏 backing 为 1×。默认公告 1，三个窗口的逻辑尺寸和 backing 均为 64×48；覆盖公告为 2 后，两者依次为 32×24、64×48、32×24。两轮均得到 `SEAT_OK`、`SHARED_OK`、`SCLEREID_M2_OK`，幸存客户端重提帧时尺寸不变。
 
-`--output-scale 2` 只覆盖来宾看到的公告，不改变宿主 backing；这不是原生 Retina 显示测试。仅覆盖会话启动时的主屏幕，未验证跨屏迁移、动态或分数比例、output enter/leave、变换或 viewporter。
+i9 主屏 backing 2× 时，`--shared --disconnect` 默认实测 `OUTPUT_SCALE native=2 advertised=2 source=backing`。重建后，三窗逻辑尺寸依次为 32×24、64×48、32×24，原生 backing 为 64×48、128×96、64×48；三窗的来宾缓冲均为 64×48。
+
+`--output-scale` 只覆盖来宾公告，不改变宿主 backing：可在 1× 屏模拟 2× 公告，也可在 2× 屏做 1× 缓冲对照。当前仅在会话启动时读取主屏比例，不覆盖跨屏迁移、动态比例或分数比例。
 
 ```sh
 python3 docs/sclereid/m2/sclereid-m2.py "$iso" --shared --reconnect --apks "$cache"
@@ -153,8 +155,7 @@ python3 docs/sclereid/m2/sclereid-m2.py "$iso" --shared --disconnect
 
 本机 Intel HVF 实测：在三窗输入、双窗客户端 SIGKILL、幸存窗第二帧后，脚本调用幸存 AppKit 窗口的 `performClose`。窗口 delegate 拦截本地关闭，经该窗口的输入通道传回 surface ID；共享 compositor 发送 `xdg_toplevel.close`。夹具在收到 close 且第二帧 callback 完成后才销毁角色和 surface；宿主读取 `CLOSED`，通过 `CLEANUP_OK` 确认原生窗口退出。输出 `CLOSE_OK`（surface 131075）、`SHARED_OK`、`RECONNECT_OK`、`SCLEREID_M2_OK`；同次也通过 `ABRUPT_OK`、`STALE_OK` 和 `SEAT_OK`。实际 backing 为 1×。
 
-本轮仍使用自有 Wayland 夹具。Alpine v3.22 community 索引可获取 `qt6-qtwayland` 6.8.3-r0 的依赖信息，但现有 `-nic none` smoke 没有离线 Qt 依赖包和测试程序；未验证真实工具包运行。关闭由脚本触发，不是物理鼠标操作。共享 resize、unmap/remap 后续验收见下文；原生 Retina 未验证。本轮 `swift test` 89 项通过，`git diff --check` 通过。
-
+关闭由脚本触发；Qt 尚无离线夹具，GTK 验收范围见下文。
 
 ### 共享窗口：resize、unmap、remap
 
@@ -167,7 +168,9 @@ python3 docs/sclereid/m2/sclereid-m2.py "$iso" --shared --disconnect --output-sc
 
 Intel i5-3210M / macOS 13.7.8 / QEMU 11.1.2 HVF，主屏 backing 1×。默认公告 1 的普通轮通过：幸存 surface `65539`、槽 `2`，逻辑、backing 与缓冲均为 `64×48 → 160×120 → 隐藏 → 64×48`，通过 `SEAT_OK`、`RESIZE_OK`、`UNMAP_OK`、`REMAP_OK`、`CLOSE_OK`、`SHARED_OK` 和 `SCLEREID_M2_OK`。覆盖公告 2 的断链轮通过：幸存 surface `131075`、槽 `2`，逻辑及 backing `32×24 → 160×120 → 隐藏 → 32×24`，对应缓冲 `64×48 → 320×240 → 无 → 64×48`。输出 `RESIZE_OK`、`UNMAP_OK`、`REMAP_OK`、`CLOSE_OK`、`SHARED_OK`、`RECONNECT_OK`、`SCLEREID_M2_OK`，同轮还通过 `ABRUPT_OK`、`STALE_OK` 和 `SEAT_OK`。
 
-resize 由脚本调用 AppKit（不是鼠标拖动），unmap 在 resize 帧回执后进行；不覆盖未回执时 unmap、连续拖动、任意协议时序、原生 Retina 或共享 GTK/Qt/Electron。`swift test` 89 项通过，差异检查包含未跟踪的 shared header。
+i9 原生 2× 主屏以默认公告运行 `--shared --disconnect` 也通过。幸存窗 resize 到逻辑 160×120，backing 和缓冲均为 320×240；同一 surface 隐藏后复用槽 2 重新映射，随后收到宿主关闭请求。该轮同时通过 `ABRUPT_OK`、`STALE_OK`、`SEAT_OK`、`RESIZE_OK`、`UNMAP_OK`、`REMAP_OK`、`CLOSE_OK`、`SHARED_OK`、`RECONNECT_OK`、`SCLEREID_M2_OK`。
+
+resize 由脚本调用 AppKit，unmap 在 resize 帧回执后进行。连续拖动和未回执时 unmap 尚未覆盖。
 
 同一主机另跑单窗 `--weston --apks "$cache"` 回归：原版 Weston `simple-shm` 提交 12 帧、7 个不同内容，resize 和 `xdg_toplevel.close` 通过，输出 `WESTON_OK`、`CLEANUP_OK` 和 `SCLEREID_M2_OK`。这是 stock Wayland 客户端，并非 GTK/Qt/Electron 或共享模式验收。
 
@@ -181,17 +184,25 @@ resize 由脚本调用 AppKit（不是鼠标拖动），unmap 在 resize 帧回�
 
 重新下载 Alpine 3.22.2 标准 ISO，完整文件通过脚本内固定 SHA-256 校验。在独立 HVF 来宾串口逐条执行：`mkfs.ext4 -F -b 4096 /dev/pmem0` 返回 0；随后 `mount -t ext4 -o dax=always /dev/pmem0 /mnt` 单独返回 0。`/proc/mounts` 报告 `rw,relatime,dax=always`，写入测试文件、`sync` 和读回均成功。未复现此前的间歇性启动阻塞，不能据此归因于 mkfs 或 mount。
 
-同一 ISO 的未改动 `--shared --disconnect` 通过 `ABRUPT_OK`、`STALE_OK`、`SEAT_OK`、`RESIZE_OK`、`UNMAP_OK`、`REMAP_OK`、`CLOSE_OK`、`SHARED_OK`、`RECONNECT_OK` 和 `SCLEREID_M2_OK`。`swift test` 89 项通过。原缓存的 `gtk-cache/` 未在本轮 scratchpad 恢复；替代 GTK runtime 准备的 `GTK_STAGE_OK` 只验证库加载与打包，不代表 GTK Wayland 窗口已提交。共享 GTK 多窗及原生 Retina 均未验收。
+同一 ISO 随后的 `--shared --disconnect` 通过；GTK 实际映射和原生 Retina 结果分别见双窗和 2× SHM 探针小节。
 
 ### GTK 3：共享 compositor 双窗
 
 ```sh
 python3 docs/sclereid/m2/sclereid-m2.py "$iso" --gtk --apks "$cache"
+python3 docs/sclereid/m2/sclereid-m2.py "$iso" --gtk --output-scale 1 --apks "$cache"
 ```
 
 缓存需包含基础 APK 和 `sclereid-m2-gtk.lock` 中的 APK；省略 `--apks` 可下载，均校验 SHA-256。GTK 3.24.50-r0、XKB 数据和桥经只读 virtio-blk 载入无网卡来宾。早期 fw_cfg 启动曾在 `GUEST_READY` 前超时；不据此归因于 HVF 或 mkfs。实际 Wayland trace 显示 GTK 需要 data-device manager 才绑定 seat，加载 XKB 数据后才完成初始化；随后遇到 `set_parent(NULL)` 和 `create_region` 缺口。data-device 和 region 仅提供此 smoke 所需的对象，不验证剪贴板、拖放或区域语义。
 
-Intel HVF 实测一个 GTK 进程同时建立两窗：surface `65539` / 槽 `2` 为 128×96，surface `65540` / 槽 `3` 为 160×96，均为 1× backing。两个首帧通过 DAX 非空检查、AppKit 几何与图层提交检查。确认 GTK 仍存活后以 SIGTERM 清理，验证两窗退出、Wayland socket/锁删除、帧端口 EOF 和 VM 正常退出；输出 `GTK_OK`、`SCLEREID_M2_OK`。不覆盖 GTK 输入、resize、popup、多帧或原生 Retina。
+i9 主屏 backing 2×：一个 GTK 进程同时建立两窗，surface `65539` / 槽 `2` 和 `65540` / 槽 `3`。两轮均输出 `GTK_OK`、`SCLEREID_M2_OK`。
+
+| 来宾公告 | 两窗逻辑尺寸 | 两窗 SHM 缓冲 | 两窗 AppKit backing |
+|---|---|---|---|
+| 默认 2×（`source=backing`） | 128×96 / 160×96 | 256×192 / 320×192 | 256×192 / 320×192 |
+| 覆盖为 1×（`source=override`） | 128×96 / 160×96 | 128×96 / 160×96 | 256×192 / 320×192 |
+
+两档比例均通过 GTK 双窗点击 `(11,8)` 和 Shift+A 回调。在两窗各持有一帧未 ACK 时，AppKit 交错发出六次 `setContentSize`；分别归还旧帧后，A 在原槽 2 提交第 5 帧（逻辑 240×160），B 在原槽 3 提交第 3 帧（256×168）。旧帧在回执前未被覆盖。`GTK_PROGRAMMATIC_RESIZE_BURST_OK` 验证尺寸合并，不测鼠标拖动帧率。最后检查双窗退出、Wayland socket/锁删除、帧端口 EOF 和 VM 退出。
 
 同主机 `--shared --disconnect` 回归通过断链、旧消息拒绝、输入、resize、unmap/remap、关闭与重连；`swift test` 89 项通过。
 
@@ -284,11 +295,126 @@ All 66 locked GTK APKs verified after retrying incomplete downloads against an a
 
 The opening and dismissal stimuli were injected on the host-to-guest seat channel, not physical mouse events. This covers one direct child and one seat, not menu item activation, nested menus, constraint handling, clicks outside all managed windows, or display scanout.
 
-### Remaining M2 acceptance
+### 共享路径后续验收
 
 - Real Qt and Electron SHM windows on HVF; GTK has bounded toplevel, input, resize, animation and close evidence above, not general toolkit compatibility.
 - Broader toolkit popup compatibility, nested grabs, outside clicks beyond managed windows, nested popups, movement and constraint adjustment; subsurface stacking, synchronization and teardown; real region, clipboard and drag-and-drop semantics.
 - Physical continuous edge drag, XDG resizing state and final-state delivery, and arbitrary event interleavings (including unmap or close with a frame in flight). The burst above tests scripted AppKit resize coalescing, not a drag gesture or refresh cadence.
-- Native 2× Retina backing and presentation, output enter/leave and display migration, dynamic/fractional scaling, transforms and viewporter. Offscreen pixels are not display scanout.
-- Physical input, full key layouts and modifiers, repeat and IME; transport fragmentation, repeated drops, unattended recovery and independent concurrent frame ports. Current reconnect creates a fresh session and does not restore old windows.
+- Display scanout, output enter/leave and display migration, dynamic/fractional scaling, transforms and viewporter. Native 2× backing was verified separately on the i9 host.
+- Broader physical input coverage, full key layouts and modifiers, repeat and IME; transport fragmentation, repeated drops, unattended recovery and independent concurrent frame ports. Current reconnect creates a fresh session and does not restore old windows.
 - Refresh cadence and presentation latency under realistic load; Apple Silicon VM reproduction. DMA-BUF/GPU acceleration and application-level performance remain separate from this SHM acceptance.
+
+### Popup：超出父窗的原生子窗口
+
+`python3 docs/sclereid/m2/sclereid-m2.py "$iso" --popup --apks "$cache"` 使用独立 Wayland 客户端，不是 GTK 菜单。64×48 的父 surface 和 24×16 的 `xdg_popup` 分别提交 1× SHM；宿主按父 surface ID 把无边框子 `NSWindow` 排在父窗之上，以父内容区左上角为原点定位。坐标 `(-12,15)` 使一半子窗位于父外框之外。移动父窗前后，WindowServer 的子窗坐标和层叠均正确，子视图位图中越界的 192 个逻辑像素逐点匹配。关闭弹窗后父窗仍在，输出 `POPUP_SMOKE_OK`、`SCLEREID_M2_OK`。
+
+这条路径验证单层、无 grab、不透明的独立 popup；不是桌面截图。绘制在父缓冲内的菜单仍随父帧呈现，不按外观猜测并拆窗。本用例仍使用 `wl_shm`；来宾桥的 [DMA-BUF 导入](../research.md#来宾桥线性-prime-dma-buf-到-appkit) 单独验收，尚未覆盖 EGL popup。
+
+### GTK 3：右键菜单选择与取消
+
+```sh
+python3 docs/sclereid/m2/sclereid-m2.py "$iso" --gtk-menu --apks "$cache"
+```
+
+本机连续两轮通过。AppKit 在 128×96 的父窗内合成右键点击 `(120,48)`；真实 GTK `GtkMenu` 创建带 grab 的 122×32 `xdg_popup`，位于父内容坐标 `(121,49)`。独立、无边框 AppKit 子窗报告父外框以外有 3680 个非透明像素。在菜单局部坐标 `(61,16)` 注入左键，AppKit 视图收到按下和抬起，来宾确认 `GTK_MENU ACTION`。
+
+再次打开菜单后点击父窗 `(11,8)`，来宾发送 `popup_done`，消费释放事件，菜单关闭而父窗保留。整个会话只有一次 action，父窗控件没有收到左键回调。关闭父窗后，宿主与来宾清理通过；输出 `GTK_MENU_SMOKE_OK`、`SCLEREID_M2_OK`。
+
+DMA-BUF 导入后复跑：默认配置及加 `virtio-gpu-pci`、`M2_DMABUF=1` 的临时对照均通过。对照中 `WAYLAND_DEBUG=client` 确认 GTK 看到了 `zwp_linux_dmabuf_v1` v4，但父窗和两次菜单仍将 `wl_shm_pool.create_buffer` 创建的缓冲挂到各自的 surface；没有 DMA-BUF 导入。两种配置均复现父框外选择、点击父窗取消且不穿透，以及宿主和 VM 清理。
+
+本用例在原生 2× 屏上固定来宾 SHM 为 1×，使用 `NSWindow.sendEvent`，不测物理鼠标命中、点到其他应用、嵌套子菜单或 GTK 阴影。屏边定位由下面的用例单独验证。
+
+### GTK 3：菜单屏边定位
+
+```sh
+python3 docs/sclereid/m2/sclereid-m2.py "$iso" --gtk-menu-edge --apks "$cache"
+```
+
+宿主把当前屏幕的 `visibleFrame` 以父内容区逻辑坐标发给来宾。来宾按 `xdg_positioner` 的约束标志逐轴先试翻转，再试平移；窗体尺寸不变。AppKit 仍创建独立的无边框子窗，并用 WindowServer 实际外框确认菜单完整位于工作区内。
+
+本机在 128×96 父窗的 `(120,88)` 右击。122×32 菜单的原始位置 `(121,89)` 向右越界 107 点、向下越界 17 点；双轴翻转到 `(-2,56)` 后，整窗落入工作区。两次打开均收到 `EDGE_OK`；首次选中只触发一次 GTK action，第二次点父窗取消且不穿透。清理通过，输出 `GTK_MENU_EDGE_SMOKE_OK` 和 `SCLEREID_M2_OK`；普通 `--gtk-menu` 回归也通过。
+
+端到端用例覆盖右下角双轴翻转。平移回退、菜单大于工作区及跨屏后重新定位未在这个用例中验证。
+
+### GTK 3：嵌套子菜单
+
+```sh
+python3 docs/sclereid/m2/sclereid-m2.py "$iso" --gtk-menu-tree --apks "$cache"
+```
+
+真实 GTK 菜单在同一共享 compositor 中创建两层 `xdg_popup`。宿主把两个 surface 映射为独立的无边框 AppKit 子窗；一级菜单相对主窗定位，二级菜单相对一级菜单定位。WindowServer 校验各层实际位置与层叠；来宾仍提交 1× SHM。
+
+- 悬停展开二级菜单并点击叶项：串口只收到一次 `GTK_MENU ACTION`。
+- 再次打开，点击一级菜单项展开二级菜单，然后点击主窗：来宾从叶到根发送 `popup_done`，消费释放事件；主窗未收到按钮回调。
+- 两轮均先关闭叶窗，此时主窗和一级菜单仍在屏上；再关闭一级菜单，此时只剩主窗。最后关闭主窗，宿主清理、来宾 socket 回收和 VM 退出均通过。
+
+输出 `GTK_MENU_TREE_SMOKE_OK`、`SCLEREID_M2_OK`。普通菜单和屏边菜单回归通过。这里使用 AppKit 合成事件；尚未验证物理命中、嵌套菜单贴边翻转或菜单展开时断链。
+
+### GTK 3：子菜单悬停专项
+
+```sh
+python3 docs/sclereid/m2/sclereid-m2.py "$iso" --gtk-menu-tree-hover --apks "$cache"
+```
+
+右键打开一级菜单后，无按键移动到子菜单项并停留；来宾提交子菜单首帧，建立 grab。以收到事件为准，不设悬停时长门槛。随后移向主窗，活动 grab 过滤该移动，两个菜单仍打开；移回一级菜单时 GTK 再次收到 motion。一级与二级菜单往返时，GTK 收到对应的 `LEAVE` / `ENTER` 和叶窗内 motion。整个无按键阶段不触发 action。
+
+随后点击叶项只触发一次 action；重新打开后点击主窗仍能取消且不穿透。专项输出 `GTK_MENU_TREE_HOVER_SMOKE_OK` 和 `SCLEREID_M2_OK`，普通树形菜单用例复跑通过。此处验证 AppKit 合成移动经代理到 GTK 的行为，不代表已验证物理鼠标命中。
+
+### GTK 3：窗口级键鼠透传
+
+```sh
+python3 docs/sclereid/m2/sclereid-m2.py "$iso" --gtk-menu-input --apks "$cache"
+python3 docs/sclereid/m2/sclereid-m2.py "$iso" --gtk-menu-input --manual --apks "$cache"
+```
+
+输入来自 AppKit 窗口，不使用全局监听。键盘按物理键位映射到 Linux evdev，由来宾 XKB 处理布局和修饰键；支持常见 ANSI / ISO / JIS 键位，不限于导航键。鼠标转发移动、拖动、左右中键、额外按钮和双轴滚动。AppKit 父窗持有键盘焦点，来宾 seat 把按键送到活动菜单；切换来宾键盘焦点或宿主失焦时清理仍按住的键，失焦也释放按住的按钮。重绘保留同一 AppKit 视图和 first responder，宿主提交新帧后才 ACK。
+
+合成端到端用例通过：Tab / Shift+Tab 在两个 GTK 控件间切换，失焦补发 Shift 抬起，方向键展开子菜单后 Return 触发一次 action，菜单关闭后焦点返回主窗。输出 `GTK_MENU_INPUT_OK: synthetic`、`SCLEREID_M2_OK`。双轴滚动、中键和侧键分别在宿主转换和来宾投递两段实测，未做同一次端到端验收。
+
+人工验收用 `--manual`：点击主窗，试普通键、Tab 与 Shift+Tab、滚轮、中键和侧键，观察窗口和串口；按住修饰键后点击另一个窗口，检查来宾释放记录。再回到主窗，右击后按 ↓，逐层按 →（每次等下一层出现），最后按 Return；激活叶项会结束会话。首次真人验收确认其余键鼠功能正常，同时发现焦点与菜单重开问题，见下文。系统拦截的快捷键、媒体键、原始 HID 与输入法组合输入不在当前路径内。
+
+### GTK 3：多层菜单
+
+```sh
+python3 docs/sclereid/m2/sclereid-m2.py "$iso" --gtk-menu-input --menu-depth 7 --apks "$cache"
+python3 docs/sclereid/m2/sclereid-m2.py "$iso" --gtk-menu-input --menu-depth 7 --manual --apks "$cache"
+```
+
+菜单不再固定两层。来宾按 popup 祖先链管理 grab、坐标和焦点；关闭时从叶到根回收。共享 DAX 目前有八个帧槽，单个主窗最多同时显示七层菜单，其他占槽 surface 会减少可用容量。辅助 surface 不占帧槽。`--menu-depth` 默认为 2，一级菜单计作第 1 层。
+
+本机合成端到端覆盖 1、2、5、7 层及原悬停回归。七层两次展开：第一次点击主窗，核对逐层关闭和释放事件不穿透；第二次按 Return，核对一次叶项 action 和焦点逐层返回主窗。输出 `GTK_MENU_INPUT_OK: synthetic`、`SCLEREID_M2_OK`。真人用例在 ↓ 后按六次 → 展开七层。
+
+### 真人输入反馈与回归
+
+本机真人复验通过：点击分支、移到其他行收起子菜单，再悬停重开并点击叶项；未报错，程序正常退出。
+
+| 问题 | 修复与当前证据 |
+|---|---|
+| 失焦时出现 `_TIPropertyValueIsValid` / `imkxpc` | macOS 14.8.9 上，原版和临时令菜单视图 `inputContext` 返回 `nil` 的版本各测两次，均出现警告。实际切换前台应用时 `F → L → F` 正常，恢复焦点后的合成按键也正常。未采用 override，未过滤日志；警告根因未定位。 |
+| Left 回撤后 Right 快速重开崩溃 | 复现确认：`xdg_surface.get_popup` 用尚未提交首帧的父菜单 `0×0` 映射尺寸校验锚框。现按已确定的父菜单几何校验，并沿活动父链查找实际发出的按键 serial；键盘焦点仍等首帧。首帧前 `CLOSED` 不再触发宿主 `TREE_CLOSE`。七层 `7 → 3 → 7` 四次 Right 无等待连发通过 5/5 轮，两层键盘和悬停回归通过；真人快速重开尚待复验。 |
+| AppKit 获焦无事件 | 菜单根窗先安装 delegate 和 first responder，再请求成为 key；普通 Seat 窗口也补发获焦事件。本机 AppKit 探针切到辅助窗再切回得到 `F → L → F`；修复后的真人整链复验仍待做。 |
+| 点击分支或按 Left 回撤后，悬停重开报 `GTK_GRAB_REJECT` | GTK 3.24.50 会复用最近的键盘或鼠标按下 serial，即使接收事件的菜单已关闭。桥现在按顶层窗口保留最近 16 个实际投递的键盘和鼠标按下 serial；关闭子菜单不清除，离开顶层焦点域或顶层销毁、取消映射时清除。不记录 `wl_pointer.enter` 或鼠标释放；子菜单的直接父菜单仍须持有当前 grab。 |
+
+七层悬停回归：`--gtk-menu-input --menu-depth 7 --hover-from 2` 先验证键盘转悬停，再用 Left 执行 `7 → 2`，不再按键或点击，仅靠悬停重新展开到第七层，最后单击叶项。Intel Mac 本机复跑通过：`GTK_MENU_DEEP_HOVER_OK`、`GTK_MENU_LEFT_HOVER_OK`、`SCLEREID_M2_OK`，无 `GTK_GRAB_REJECT`；默认两层键盘输入也复跑通过。此前 `--hover-from 4`（键盘转悬停）与 `--hover-from 1`（从右键根菜单开始悬停）均通过。
+
+AppKit 按钮投递探针：用 `NSApp.postEvent` 将按钮事件排入应用事件队列，经视图回调、宿主输入转发到 `wl_pointer.button`，不直接向来宾注入按钮。两层菜单中，GTK 用分支左键按下 serial `13` 创建子菜单，叶项可激活。三层复现中，第二层左键按下 serial `21`，释放为 `22`；移动到根菜单首行关闭第二、三层，悬停回分支后 `xdg_popup.grab` 仍用 `21`。修复前被拒绝，修复后相同序列重开两层，输出 `GTK_MENU ACTION`、`SCLEREID_M2_OK`。两层默认键盘和悬停、七层键盘 `7 → 3 → 7` 及悬停 `7 → 2 → 7` 均复跑通过。
+
+系统级 `CGEvent` 投递权限不可用，应用队列中的合成 `mouseMoved` 也未到达视图；三层探针的移动沿用 `TREE_CLICK MOVE` 路由。真人复验使用上节 `--manual` 命令；Left 后快速 Right 重开和切回主窗的焦点事件不计入本次复验。
+
+### 七层菜单展开时断链
+
+Intel Mac 本机：主窗和七层菜单均已呈现，扣住叶项首帧 ACK 后主动关闭帧通道。AppKit 在 stdin EOF 后从叶到根关闭窗口，输出 `CLEANUP_OK`；来宾报告 `SHARED_HOST_LOST abandoned=1`，桥和 GTK 客户端均退出，Wayland socket 和锁文件移除，八个 DAX 槽全部清零。GTK 的 `Broken pipe` 是本次主动断链的预期结果。这里验证的是清理，不是恢复原菜单。
+
+### GTK 窗口内容区拖动
+
+来宾 `xdg_toplevel.move` 须匹配当前顶层的左键按下 serial，且没有活动菜单 grab。宿主再核对同一次按下的 ID，使用屏幕坐标差移动原生窗；松键或失焦结束拖动。不同于直接拖 macOS 标题栏，这条路径由 GTK 发起。
+
+本机 QEMU 探针从 GTK 收到 `xdg_toplevel.move`，通过 AppKit 拖动回调测得窗口移动 `(+37, +19)` 点；松键后旧请求未再次移动窗口，随后可打开菜单并激活叶项。以上位移和旧请求检查来自合成探针。本机人工正向测试也已通过：从 GTK 内容区发起拖动时，AppKit 窗口正常跟随鼠标。该结果适用于同类 GTK 内容区拖动场景。
+
+人工复验命令：
+
+```sh
+M2_GTK_MOVE=1 python3 docs/sclereid/m2/sclereid-m2.py "$iso" --gtk-menu-input --manual --wayland-trace --apks "$cache"
+```
+
+从 GTK 窗口内容区底部按住左键拖动（不要拖 macOS 标题栏），松键后再移动鼠标，确认窗口保持原位；最后用右键菜单激活叶项退出。

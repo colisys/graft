@@ -5,6 +5,8 @@
 #include <time.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
+#include <stdarg.h>
 
 #include <stdatomic.h>
 #include <stdint.h>
@@ -47,7 +49,7 @@ static struct {
     unsigned tick;
 } held[MAX_SLOTS];
 static int last_tick = -1;
-static char ack_line[32];
+static char ack_line[80]; /* W carries a surface ID and four 32-bit coordinates/sizes. */
 static size_t ack_len;
 
 enum { XDG_WIDTH = 640, XDG_HEIGHT = 480 };
@@ -65,7 +67,7 @@ static void send_configure(int w, int h) {
     wl_resource_post_event(role, 0, configure_serial);
 }
 
-static int shared;
+static int shared, popup_mode, menu_mode, tree_mode, keyboard_mode;
 static void shared_command(void);
 
 static void xdg_command(void) {
@@ -125,6 +127,11 @@ static void acknowledge(void) {
     fail("unexpected ACK line");
 }
 
+static void lose_host(void) {
+    host_lost = 1;
+    wl_display_terminate(display);
+}
+
 static int host_ready(int fd, uint32_t mask, void *data) {
     (void)data;
     if (mask & (WL_EVENT_ERROR | WL_EVENT_HANGUP)) goto lost;
@@ -143,8 +150,7 @@ static int host_ready(int fd, uint32_t mask, void *data) {
     }
     return 0;
 lost:
-    host_lost = 1;
-    wl_display_terminate(display);
+    lose_host();
     return 0;
 }
 
@@ -309,6 +315,7 @@ static void set_scale(struct wl_client *c, struct wl_resource *s, int32_t scale)
 static const struct wl_surface_interface surface_ops = {
     .destroy = destroy_resource, .attach = attach, .commit = commit, .set_buffer_scale = set_scale
 };
+#include "sclereid-m2-dmabuf.h"
 #include "sclereid-m2-shared.h"
 
 static void create_surface(struct wl_client *c, struct wl_resource *r, uint32_t id) {
@@ -417,6 +424,8 @@ static void client_created(struct wl_listener *listener, void *data) {
 }
 
 static int server(const char *socket_name) {
+    /* Let a frame-port write failure reach the normal host-loss teardown. */
+    if (shared && signal(SIGPIPE, SIG_IGN) == SIG_ERR) sysfail("ignore SIGPIPE");
     char path[48];
     snprintf(path, sizeof path, "/mnt/frame%d", lane);
     int fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0600);
@@ -434,11 +443,12 @@ static int server(const char *socket_name) {
     if (!display || wl_display_init_shm(display) < 0 ||
         !wl_global_create(display, &wl_compositor_interface, (retina || shared) ? 3 : 1, NULL, bind_compositor))
         fail("initializing Wayland server");
+    if (shared && getenv("M2_DMABUF") && !strcmp(getenv("M2_DMABUF"),"1")) dma_init();
     wl_list_init(&devices);
     if(shared && !wl_global_create(display,&wl_output_interface,2,NULL,bind_output)) fail("creating output");
     if(shared && !wl_global_create(display,&wl_data_device_manager_interface,1,NULL,bind_data_manager)) fail("creating data device manager");
-    if(shared && !wl_global_create(display,&wl_subcompositor_interface,1,NULL,bind_sub)) fail("creating subcompositor");
-    if(shared && !wl_global_create(display,&wl_seat_interface,2,NULL,bind_seat)) fail("creating seat");
+    if(shared && !popup_mode && !wl_global_create(display,&wl_subcompositor_interface,1,NULL,bind_sub)) fail("creating subcompositor");
+    if(shared && !wl_global_create(display,&wl_seat_interface,keyboard_mode ? 5 : 2,NULL,bind_seat)) fail("creating seat");
     struct wl_listener created = { .notify = client_created };
     struct wl_event_source *acks = NULL;
     if (xdg && !wl_global_create(display, &shell_base, 1, NULL, bind_shell)) fail("creating xdg_wm_base");
@@ -460,6 +470,7 @@ static int server(const char *socket_name) {
     }
     wl_display_destroy_clients(display);
     wl_display_destroy(display);
+    if (dma_table>=0) close(dma_table);
     if (shared) shared_reset();
     munmap(frame, slots * RANGE);
     if (host_lost) return shared ? 2 : 1;
@@ -592,6 +603,58 @@ static void fixture_popup(struct wl_proxy *parent, struct wl_surface *parent_sur
     wl_surface_destroy(surface); wl_buffer_destroy(buffer);
     wl_proxy_marshal(parent,3,0,0,64/output_scale,48/output_scale);
     fprintf(stderr,"FIXTURE_POPUP_DONE\n");
+}
+static void popup_geometry(void *data, struct wl_proxy *role_proxy, int x, int y, int w, int h) {
+    (void)role_proxy;
+    struct fixture_role *state=data;
+    if (state->ready || x!=-12 || y!=15 || w!=24 || h!=16) fail("unexpected popup configure");
+    state->w=w; state->h=h;
+}
+static void fixture_destroy_proxy(struct wl_proxy *proxy) {
+    wl_proxy_marshal(proxy,0); wl_proxy_destroy(proxy);
+}
+static int popup_fixture(void) {
+    struct fixture_role state[2]={0};
+    struct wl_surface *s[2]; struct wl_proxy *xd[2], *role_proxy[2];
+    static void (*configure[])(void)={(void(*)(void))fixture_configure};
+    static void (*top_events[])(void)={(void(*)(void))fixture_size,(void(*)(void))fixture_close};
+    static void (*popup_ops[])(void)={(void(*)(void))popup_geometry,(void(*)(void))fixture_close};
+    static const struct wl_callback_listener cb_ops={fixture_done};
+    if (!fixture_base || wl_display_roundtrip(display)<0 || (output_scale!=1 && output_scale!=2)) fail("missing popup fixture globals");
+    for (int i=0; i<2; ++i) {
+        s[i]=wl_compositor_create_surface(compositor);
+        wl_surface_set_buffer_scale(s[i],output_scale);
+        xd[i]=wl_proxy_marshal_constructor(fixture_base,2,&shell_surface,NULL,s[i]);
+        wl_proxy_add_listener(xd[i],configure,&state[i]);
+        if (!i) role_proxy[i]=wl_proxy_marshal_constructor(xd[i],1,&shell_top,NULL);
+        else {
+            struct wl_proxy *pos=wl_proxy_marshal_constructor(fixture_base,1,&shell_positioner,NULL);
+            wl_proxy_marshal(pos,1,24,16); wl_proxy_marshal(pos,2,4,5,12,8);
+            wl_proxy_marshal(pos,3,8u); wl_proxy_marshal(pos,4,8u); /* bottom-right for both */
+            wl_proxy_marshal(pos,6,-28,2); /* 12 logical pixels beyond the parent's left edge */
+            role_proxy[i]=wl_proxy_marshal_constructor(xd[i],2,&shell_popup,NULL,xd[0],pos);
+            fixture_destroy_proxy(pos); /* placement is a snapshot */
+        }
+        wl_proxy_add_listener(role_proxy[i],i ? popup_ops : top_events,&state[i]);
+        wl_surface_commit(s[i]);
+        while (!state[i].ready) if (wl_display_dispatch(display)<0) fail("popup fixture configure");
+        if (i && !state[i].w) fail("missing popup geometry before surface configure");
+        struct wl_buffer *b=fixture_buffer((i ? 24 : 64)*output_scale,(i ? 16 : 48)*output_scale);
+        int done=0;
+        wl_callback_add_listener(wl_surface_frame(s[i]),&cb_ops,&done);
+        wl_surface_attach(s[i],b,0,0); wl_surface_commit(s[i]);
+        while (!done) if (wl_display_dispatch(display)<0) fail("popup fixture frame");
+        wl_buffer_destroy(b);
+    }
+    for (int i=1; i>=0; --i) {
+        while (!state[i].closed) if (wl_display_dispatch(display)<0) fail("popup fixture close");
+        if (i && state[0].closed) fail("parent closed before popup");
+        fixture_destroy_proxy(role_proxy[i]); fixture_destroy_proxy(xd[i]); wl_surface_destroy(s[i]);
+        if (wl_display_roundtrip(display)<0) fail("popup fixture teardown");
+    }
+    fixture_destroy_proxy(fixture_base);
+    if (wl_display_roundtrip(display)<0) fail("popup fixture shell teardown");
+    wl_display_disconnect(display); return 0;
 }
 static int fixture(struct wl_buffer *b) {
     int count=getenv("M2_VICTIM") ? 2 : 1, done=0;
@@ -815,6 +878,7 @@ static int client(const char *socket_name) {
     struct wl_registry *r = wl_display_get_registry(display);
     if (!r || wl_registry_add_listener(r, &registry_ops, NULL) || wl_display_roundtrip(display) < 0 ||
         !shm || !compositor) fail("missing Wayland globals");
+    if (popup_mode) return popup_fixture();
     int fd = memfd_create("sclereid-shm", MFD_CLOEXEC);
     if (fd < 0 || ftruncate(fd, slots * PIXELS)) sysfail("create SHM pool");
     uint32_t *pixels = mmap(NULL, slots * PIXELS, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -862,7 +926,11 @@ int main(int argc, char **argv) {
     const char *socket_name = getenv("WAYLAND_DISPLAY");
     if (!getenv("XDG_RUNTIME_DIR") || !socket_name || !*socket_name || strchr(socket_name, '/'))
         fail("set XDG_RUNTIME_DIR and a private WAYLAND_DISPLAY socket name");
-    shared = getenv("M2_SHARED") != NULL;
+    popup_mode = argc==2 && (!strcmp(argv[1],"shared-popup") || !strcmp(argv[1],"client-popup"));
+    keyboard_mode = popup_mode && getenv("M2_GTK_KEYBOARD") && !strcmp(getenv("M2_GTK_KEYBOARD"), "1");
+    tree_mode = keyboard_mode || (popup_mode && getenv("M2_GTK_MENU_TREE") && !strcmp(getenv("M2_GTK_MENU_TREE"), "1"));
+    menu_mode = tree_mode || (popup_mode && getenv("M2_GTK_MENU") && !strcmp(getenv("M2_GTK_MENU"), "1"));
+    shared = popup_mode || getenv("M2_SHARED") != NULL;
     retina = getenv("M2_RETINA") != NULL;
     const char *mode = getenv("M2_ANIMATE");
     animate = mode && !strcmp(mode, "1");
@@ -872,12 +940,12 @@ int main(int argc, char **argv) {
         slots = setting("M2_SLOTS", 1, MAX_SLOTS);
         ticks = FPS * setting("M2_SECONDS", 3, 30);
     }
-    if (argc == 2 && !strcmp(argv[1], "server")) {
+    if (argc == 2 && (!strcmp(argv[1], "server") || !strcmp(argv[1], "shared-popup"))) {
         mode = getenv("M2_XDG");
         xdg = mode && !strcmp(mode, "1");
         if (shared) {
             xdg = 1;
-            slots = NSURF;
+            slots = DAX_SLOTS;
             session_base = (unsigned)setting("M2_SESSION", 1, 65535) << 16;
             next_id = session_base;
             shared_output_scale = setting("M2_OUTPUT_SCALE", 1, 2);
@@ -890,6 +958,6 @@ int main(int argc, char **argv) {
         if ((animate || xdg) && !rc && (fputs("DONE\n", stdout) == EOF || fflush(stdout))) sysfail("stdout");
         return rc;
     }
-    if (argc == 2 && !strcmp(argv[1], "client")) return client(socket_name);
-    fail("usage: sclereid-m2-guest server|client");
+    if (argc == 2 && (!strcmp(argv[1], "client") || !strcmp(argv[1], "client-popup"))) return client(socket_name);
+    fail("usage: sclereid-m2-guest server|client|shared-popup|client-popup");
 }
